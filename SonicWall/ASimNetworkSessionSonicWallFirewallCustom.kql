@@ -1,0 +1,40 @@
+// =============================================================================================
+// ASIM Network Session Parser (parameterless / "ASim") -- SonicWall Firewall (Custom)
+// =============================================================================================
+// Thin wrapper around vimNetworkSessionSonicWallFirewallCustom, called with no-op filter
+// values. Standard ASIM parameterless-parser pattern: exists so tools/queries that expect a
+// zero-argument, always-return-everything view of the schema have something to call
+// directly, and so it can be registered as a Kusto view for auto-discovery by
+// _ASim_NetworkSession() (or your workspace's imNetworkSession/ASimNetworkSession custom
+// registration, if you're wiring this in the way discussed earlier in this parser's history).
+//
+// DEPENDENCY: vimNetworkSessionSonicWallFirewallCustom must already be saved as a function in
+// this workspace before saving this one -- deploy vimNetworkSessionSonicWallFirewallCustom.kql
+// (or its ARM template) first.
+//
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Confirm vimNetworkSessionSonicWallFirewallCustom is already saved as a function.
+// 2. Paste this file into Log Analytics / Microsoft Sentinel > Logs and run it to confirm
+//    it returns rows.
+// 3. "Save as Function", name it exactly ASimNetworkSessionSonicWallFirewallCustom.
+// 4. If you're registering custom source parsers into imNetworkSession/ASimNetworkSession
+//    (see the Meraki custom parser and the ExcludevimNetworkSessionCiscoFTD/pack= debugging
+//    from earlier in this conversation), add this one the same way -- using ITS OWN unique
+//    ExcludeASimNetworkSessionSonicWallFirewallCustom disabled-parsers key, not a copied one.
+// =============================================================================================
+let ASimNetworkSessionSonicWallFirewallCustom = view() {
+    vimNetworkSessionSonicWallFirewallCustom(
+        starttime = datetime(null),
+        endtime = datetime(null),
+        srcipaddr_has_any_prefix = dynamic([]),
+        dstipaddr_has_any_prefix = dynamic([]),
+        ipaddr_has_any_prefix = dynamic([]),
+        dstportnumber = int(null),
+        hostname_has_any = dynamic([]),
+        dvcaction = dynamic([]),
+        eventresult = '*',
+        disabled = false
+    )
+};
+ASimNetworkSessionSonicWallFirewallCustom

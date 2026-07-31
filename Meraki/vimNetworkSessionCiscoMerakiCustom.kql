@@ -149,7 +149,7 @@ let vimNetworkSessionCiscoMerakiCustom = (
             // ip_flow_start/ip_flow_end messages. Flagged via _DvcActionInferred so this
             // stays distinguishable downstream from FirewallFlow rows where the device
             // explicitly logged the decision (e.g. for future rule-tuning audits).
-            DvcAction         = 'Allow',
+            DvcAction         = iff(EventOriginalType in ("ip_flow_start"), "Allow", "Other" ),
             DvcOriginalAction = EventOriginalType,
             _DvcActionInferred = true
         | extend

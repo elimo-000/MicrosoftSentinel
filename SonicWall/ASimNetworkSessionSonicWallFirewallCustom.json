@@ -1,0 +1,27 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "string",
+            "metadata": {
+                "description": "Name of the Log Analytics / Microsoft Sentinel workspace to deploy this parser to. vimNetworkSessionSonicWallFirewallCustom must already be deployed in this workspace -- this function calls it by name at query time."
+            }
+        }
+    },
+    "resources": [
+        {
+            "type": "Microsoft.OperationalInsights/workspaces/savedSearches",
+            "apiVersion": "2020-08-01",
+            "name": "[concat(parameters('workspace'), '/ASimNetworkSessionSonicWallFirewallCustom')]",
+            "properties": {
+                "eTag": "*",
+                "displayName": "SonicWall Firewall Network Session Parser (Custom, parameterless)",
+                "category": "ASIM Custom Parsers",
+                "functionAlias": "ASimNetworkSessionSonicWallFirewallCustom",
+                "query": "// =============================================================================================\n// ASIM Network Session Parser (parameterless / \"ASim\") -- SonicWall Firewall (Custom)\n// =============================================================================================\n// Thin wrapper around vimNetworkSessionSonicWallFirewallCustom, called with no-op filter\n// values. Standard ASIM parameterless-parser pattern: exists so tools/queries that expect a\n// zero-argument, always-return-everything view of the schema have something to call\n// directly, and so it can be registered as a Kusto view for auto-discovery by\n// _ASim_NetworkSession() (or your workspace's imNetworkSession/ASimNetworkSession custom\n// registration, if you're wiring this in the way discussed earlier in this parser's history).\n//\n// DEPENDENCY: vimNetworkSessionSonicWallFirewallCustom must already be saved as a function in\n// this workspace before saving this one -- deploy vimNetworkSessionSonicWallFirewallCustom.kql\n// (or its ARM template) first.\n//\n// DEPLOYMENT\n// -----------------------------------------------------------------------------------------\n// 1. Confirm vimNetworkSessionSonicWallFirewallCustom is already saved as a function.\n// 2. Paste this file into Log Analytics / Microsoft Sentinel > Logs and run it to confirm\n//    it returns rows.\n// 3. \"Save as Function\", name it exactly ASimNetworkSessionSonicWallFirewallCustom.\n// 4. If you're registering custom source parsers into imNetworkSession/ASimNetworkSession\n//    (see the Meraki custom parser and the ExcludevimNetworkSessionCiscoFTD/pack= debugging\n//    from earlier in this conversation), add this one the same way -- using ITS OWN unique\n//    ExcludeASimNetworkSessionSonicWallFirewallCustom disabled-parsers key, not a copied one.\n// =============================================================================================\nlet ASimNetworkSessionSonicWallFirewallCustom = view() {\n    vimNetworkSessionSonicWallFirewallCustom(\n        starttime = datetime(null),\n        endtime = datetime(null),\n        srcipaddr_has_any_prefix = dynamic([]),\n        dstipaddr_has_any_prefix = dynamic([]),\n        ipaddr_has_any_prefix = dynamic([]),\n        dstportnumber = int(null),\n        hostname_has_any = dynamic([]),\n        dvcaction = dynamic([]),\n        eventresult = '*',\n        disabled = false\n    )\n};\nASimNetworkSessionSonicWallFirewallCustom\n",
+                "version": 2
+            }
+        }
+    ]
+}

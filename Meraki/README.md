@@ -25,10 +25,13 @@ None of Microsoft's published Meraki parsers cover this ingestion path:
 Three event branches, unioned into one Network Session stream:
 
 1. **IP flow tracking** (`ip_flow_start` / `ip_flow_end`) — raw flow records
-   with no explicit allow/deny in the payload; `DvcAction` is inferred as
-   `Allow` (a tracked flow implies the firewall didn't drop it), flagged via
-   `AdditionalFields.DvcActionInferred` so it stays distinguishable from
-   explicit decisions.
+   with no explicit allow/deny in the payload. Only `ip_flow_start` infers
+   `DvcAction = Allow` (a flow being newly tracked implies the firewall let
+   it through); `ip_flow_end` is a session-teardown notification, not an
+   allow/deny decision in itself, so it's mapped to `DvcAction = Other`
+   instead of inheriting the inferred `Allow`. Both are flagged via
+   `AdditionalFields.DvcActionInferred` so they stay distinguishable from
+   `FirewallFlow` rows where the device explicitly logged the decision.
 2. **Firewall rule matches** (`flows` / `firewall` / `vpn_firewall` /
    `cellular_firewall` / `bridge_anyconnect_client_vpn_firewall`) — handles
    both old (`flows allow src=...`) and new (`firewall src=... pattern:
