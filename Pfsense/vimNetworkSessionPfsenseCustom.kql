@@ -1,0 +1,157 @@
+let vimNetworkSessionPfsense = (
+    starttime:datetime = datetime(null),
+    endtime:datetime = datetime(null),
+    srcipaddr_has_any_prefix:dynamic = dynamic([]),
+    dstipaddr_has_any_prefix:dynamic = dynamic([]),
+    ipaddr_has_any_prefix:dynamic = dynamic([]),
+    dstportnumber:int = int(null),
+    hostname_has_any:dynamic = dynamic([]),
+    dvcaction:dynamic = dynamic([]),
+    eventresult:string = '*',
+    disabled:bool = false
+)
+{
+    CommonSecurityLog
+    | where not(disabled)
+    | where DeviceVendor == "NETGATE"
+        and DeviceProduct == "pfsense"
+        and DeviceEventClassID == "filterlog"
+    | where isnull(starttime) or TimeGenerated >= starttime
+    | where isnull(endtime) or TimeGenerated <= endtime
+    // Filter on raw fields first, before the normalization work below, so
+    // non-matching rows are dropped as cheaply as possible.
+    | where isnull(dstportnumber) or DestinationPort == dstportnumber
+    | where array_length(hostname_has_any) == 0
+        or DeviceName has_any (hostname_has_any)
+        or Computer has_any (hostname_has_any)
+    | where array_length(dvcaction) == 0
+        or DeviceAction has_any (dvcaction)
+    // IPv4 / IPv6 address resolution.
+    // Fix: src/dst -> SourceIP/DestinationIP come through as an EMPTY STRING
+    // (not null) on IPv6 rows in this CEF template, because the rsyslog
+    // template always emits src=/dst= even when $!srcip/$!dstip were never
+    // set. coalesce() only falls through on null, so the previous version
+    // never actually reached the c6a1/c6a2 IPv6 fields -- every IPv6 session
+    // ended up with a blank SrcIpAddr/DstIpAddr. Use isnotempty() instead.
+    | extend
+        SrcIpAddr = iff(isnotempty(SourceIP), tostring(SourceIP), tostring(column_ifexists("DeviceCustomIPv6Address1", ""))),
+        DstIpAddr = iff(isnotempty(DestinationIP), tostring(DestinationIP), tostring(column_ifexists("DeviceCustomIPv6Address2", "")))
+    | where array_length(srcipaddr_has_any_prefix) == 0
+        or SrcIpAddr has_any (srcipaddr_has_any_prefix)
+    | where array_length(dstipaddr_has_any_prefix) == 0
+        or DstIpAddr has_any (dstipaddr_has_any_prefix)
+    | where array_length(ipaddr_has_any_prefix) == 0
+        or SrcIpAddr has_any (ipaddr_has_any_prefix)
+        or DstIpAddr has_any (ipaddr_has_any_prefix)
+    // Core field normalization.
+    | extend
+        SrcPortNumber = toint(SourcePort),
+        DstPortNumber = toint(DestinationPort),
+        NetworkProtocol = toupper(tostring(Protocol)),
+        EventOriginalType = tostring(DeviceEventClassID),
+        EventOriginalSubType = tostring(Activity),
+        // Fix: the raw pre-normalized action belongs in DvcOriginalAction,
+        // not EventOriginalResultDetails (that field feeds EventResultDetails,
+        // a different concept -- see below).
+        DvcOriginalAction = tostring(DeviceAction),
+        EventOriginalResultDetails = tostring(Reason),
+        EventOriginalSeverity = tostring(LogSeverity),
+        DvcInboundInterface = tostring(DeviceInboundInterface),
+        DvcOutboundInterface = tostring(DeviceOutboundInterface),
+        EventMessage = tostring(Reason),
+        DvcHostname = coalesce(tostring(DeviceName), tostring(Computer)),
+        Dvc = coalesce(tostring(DeviceName), tostring(Computer), tostring(DeviceAddress)),
+        CompanyResourceId = tostring(column_ifexists("_ResourceId", ""))
+    // Rule identity.
+    // Fix: "Rule"/"RuleLabel" aren't ASIM NetworkSession fields. The schema
+    // defines NetworkRuleNumber (int) and NetworkRuleName (string).
+    // NetworkRuleNumber = pf's rule ordinal position (cs1).
+    // NetworkRuleName = pf's trackerid, extracted from AdditionalExtensions
+    // (it's a non-standard CEF key, so it doesn't get its own column). Unlike
+    // the ordinal rule number, trackerid stays stable if rules get reordered,
+    // so it's the better field to key hunts/detections on.
+    | extend
+        NetworkRuleNumber = toint(DeviceCustomString1),
+        NetworkRuleName = extract(@'trackerid=([^\s]+)', 1, AdditionalExtensions)
+    // Bytes.
+    // Fix: byte counts weren't surfaced into ASIM at all before. pf logs one
+    // packet per line, in only one direction at a time (in= OR out=, never
+    // both), so there's no reliable per-session Src/Dst split available --
+    // only the total for this logged packet is meaningful here.
+    | extend
+        NetworkBytes = toint(coalesce(ReceivedBytes, SentBytes))
+    // ICMP type (best-effort text extraction from AdditionalExtensions).
+    // pf doesn't expose the raw numeric RFC792/RFC4443 type, only a text
+    // category (request/reply/unreachproto/...), so NetworkIcmpCode is left
+    // unset -- only NetworkIcmpType is populated.
+    | extend
+        NetworkIcmpType = iff(NetworkProtocol in ("ICMP", "ICMPV6"),
+            extract(@'icmptype=([^\s]+)', 1, AdditionalExtensions), "")
+
+    // Normalize firewall action to the ASIM controlled vocabulary.
+    | extend
+        DvcAction = case(
+            DeviceAction in~ ("pass", "allow", "allowed", "accept"), "Allow",
+            DeviceAction in~ ("block", "deny", "denied", "drop", "dropped", "reject"), "Deny",
+            tostring(DeviceAction)
+        )
+
+    // Direction. This reflects pf's single-interface ifdir (in/out), not
+    // necessarily true network-level directionality relative to a trust zone
+    // -- treat as best-effort, the same caveat that applies to other
+    // CEF-sourced ASIM Network Session parsers.
+    | extend
+        NetworkDirection = case(
+            CommunicationDirection == "0" or CommunicationDirection =~ "Inbound" or CommunicationDirection =~ "in", "Inbound",
+            CommunicationDirection == "1" or CommunicationDirection =~ "Outbound" or CommunicationDirection =~ "out", "Outbound",
+            ""
+        )
+    // Result and severity.
+    // Fix: EventResult was hardcoded to "Success" for every row, including
+    // blocked/denied traffic -- this would have broken any rule/workbook that
+    // filters on result. Both are now derived from the normalized action
+    // rather than from the raw numeric CEF severity (3/5), since those don't
+    // map cleanly onto ASIM's Informational/Low/Medium/High buckets for a
+    // simple pass/block source. EventSeverity was also previously missing.
+    | extend
+        EventResult = iff(DvcAction == "Allow", "Success", "Failure"),
+        EventResultDetails = tostring(Reason),
+        EventSeverity = iff(DvcAction == "Allow", "Informational", "Low")
+    // ASIM core fields.
+    | extend
+        EventSchema = "NetworkSession",
+        EventSchemaVersion = "0.2.7",
+        EventType = "NetworkSession",
+        EventVendor = "Netgate",
+        EventProduct = "pfSense",
+        EventCount = toint(coalesce(EventCount, 1)),
+        EventStartTime = TimeGenerated,
+        EventEndTime = TimeGenerated
+
+    // Aliases commonly expected by ASIM-style content.
+    | extend
+        Src = SrcIpAddr,
+        Dst = DstIpAddr,
+        IpAddr = SrcIpAddr,
+        DvcId = coalesce(CompanyResourceId, tostring(DeviceExternalID), Dvc),
+        DvcIdType = iff(isnotempty(CompanyResourceId), "AzureResourceId", "")
+
+    | where eventresult == "*"
+        or EventResult =~ eventresult
+
+    // Keep _ResourceId. Do not project it away in your company fork.
+    | project-away
+        SourceSystem
+};
+vimNetworkSessionPfsense(
+    starttime,
+    endtime,
+    srcipaddr_has_any_prefix,
+    dstipaddr_has_any_prefix,
+    ipaddr_has_any_prefix,
+    dstportnumber,
+    hostname_has_any,
+    dvcaction,
+    eventresult,
+    disabled
+)

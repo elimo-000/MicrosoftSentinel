@@ -1,0 +1,34 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "string",
+            "metadata": {
+                "description": "The Microsoft Sentinel workspace into which the function will be deployed. Has to be in the selected Resource Group."
+            }
+        }
+    },
+    "resources": [
+        {
+            "type": "Microsoft.OperationalInsights/workspaces/savedSearches",
+            "apiVersion": "2020-08-01",
+            "name": "[concat(parameters('workspace'), '/ASimNetworkSessionPfsenseCustom')]",
+            "properties": {
+                "eTag": "*",
+                "displayName": "Network Session ASIM parser for pfSense (parameter-less)",
+                "category": "ASIM",
+                "functionAlias": "ASimNetworkSessionPfsenseCustom",
+                "functionParameters": "",
+                "version": 2,
+                "tags": [
+                    {
+                        "name": "description",
+                        "value": "Parameter-less companion to vimNetworkSessionPfsenseCustom, required alongside the filtering parser for the ASimNetworkSession unifying parser. Deploy vimNetworkSessionPfsenseCustom.json to the same workspace first."
+                    }
+                ],
+                "query": "// New file. Microsoft's ASIM parser guidance is explicit that a custom source\n// needs BOTH pieces: \"Make sure to add both a filtering custom parser and a\n// parameter-less custom parser.\" You already deployed and wired up the\n// filtering one (vimNetworkSessionPfsenseCustom) into imNetworkSession -- this is\n// the parameter-less companion, needed if you also want pfSense picked up by\n// the non-parametrized ASimNetworkSession unifying parser.\n//\n// Deploy this as its own saved KQL function (separate from\n// vimNetworkSessionPfsenseCustom), named ASimNetworkSessionPfsense, and add the\n// equivalent reference line for it in your custom ASimNetworkSession\n// unifying parser, the same way you already did for vimNetworkSessionPfsenseCustom\n// in imNetworkSession.\nlet ASimNetworkSessionPfsense = () {\n    vimNetworkSessionPfsenseCustom(\n        starttime = datetime(null),\n        endtime = datetime(null),\n        srcipaddr_has_any_prefix = dynamic([]),\n        dstipaddr_has_any_prefix = dynamic([]),\n        ipaddr_has_any_prefix = dynamic([]),\n        dstportnumber = int(null),\n        hostname_has_any = dynamic([]),\n        dvcaction = dynamic([]),\n        eventresult = '*',\n        disabled = false\n    )\n};\nASimNetworkSessionPfsense()"
+            }
+        }
+    ]
+}

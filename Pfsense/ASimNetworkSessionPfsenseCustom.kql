@@ -1,0 +1,27 @@
+// New file. Microsoft's ASIM parser guidance is explicit that a custom source
+// needs BOTH pieces: "Make sure to add both a filtering custom parser and a
+// parameter-less custom parser." You already deployed and wired up the
+// filtering one (vimNetworkSessionPfsense) into imNetworkSession -- this is
+// the parameter-less companion, needed if you also want pfSense picked up by
+// the non-parametrized ASimNetworkSession unifying parser.
+//
+// Deploy this as its own saved KQL function (separate from
+// vimNetworkSessionPfsense), named ASimNetworkSessionPfsense, and add the
+// equivalent reference line for it in your custom ASimNetworkSession
+// unifying parser, the same way you already did for vimNetworkSessionPfsense
+// in imNetworkSession.
+let ASimNetworkSessionPfsense = () {
+    vimNetworkSessionPfsense(
+        starttime = datetime(null),
+        endtime = datetime(null),
+        srcipaddr_has_any_prefix = dynamic([]),
+        dstipaddr_has_any_prefix = dynamic([]),
+        ipaddr_has_any_prefix = dynamic([]),
+        dstportnumber = int(null),
+        hostname_has_any = dynamic([]),
+        dvcaction = dynamic([]),
+        eventresult = '*',
+        disabled = false
+    )
+};
+ASimNetworkSessionPfsense()
