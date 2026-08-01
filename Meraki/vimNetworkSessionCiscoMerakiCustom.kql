@@ -119,11 +119,11 @@ let vimNetworkSessionCiscoMerakiCustom = (
               src: string,
               dst: string,
               protocol: string,
-              sport: long,
-              dport: long,
+              sport: int,
+              dport: int,
               translated_src_ip: string,
               translated_dst_ip: string,
-              translated_port: long
+              translated_port: int
           ) with (pair_delimiter=' ', kv_delimiter='=')
         | extend
             EventType    = 'NetworkSession',
@@ -140,8 +140,8 @@ let vimNetworkSessionCiscoMerakiCustom = (
             // Meraki emits a single "translated_port" -- it belongs to whichever side
             // actually got translated (src-side for outbound/SNAT, dst-side for
             // inbound/DNAT). Confirmed against real samples of both directions.
-            SrcNatPortNumber = iff(isnotempty(translated_src_ip), translated_port, long(null)),
-            DstNatPortNumber = iff(isnotempty(translated_dst_ip), translated_port, long(null))
+            SrcNatPortNumber = iff(isnotempty(translated_src_ip), translated_port, int(null)),
+            DstNatPortNumber = iff(isnotempty(translated_dst_ip), translated_port, int(null))
         | extend
             // A flow can only reach "tracked" state if the firewall didn't drop it --
             // a blocked packet never establishes a session. So DvcAction=Allow is a sound
@@ -195,8 +195,8 @@ let vimNetworkSessionCiscoMerakiCustom = (
               dst: string,
               mac: string,
               protocol: string,
-              sport: long,
-              dport: long,
+              sport: int,
+              dport: int,
               type: string   // unconfirmed against production samples so far -- app-layer
                               // identification field seen on some Advanced-Security-licensed
                               // deployments; parse-kv safely leaves this null if absent
@@ -240,9 +240,9 @@ let vimNetworkSessionCiscoMerakiCustom = (
         | extend _Msg = extract(@"msg=\s*'(.*)'\s*$", 1, RawEventData)
         | extend
             DstIpAddr     = extract(@'Local\[(\d+\.\d+\.\d+\.\d+)\.\d+\]', 1, _Msg),
-            DstPortNumber = tolong(extract(@'Local\[\d+\.\d+\.\d+\.\d+\.(\d+)\]', 1, _Msg)),
+            DstPortNumber = toint(extract(@'Local\[\d+\.\d+\.\d+\.\d+\.(\d+)\]', 1, _Msg)),
             SrcIpAddr     = extract(@'Peer\[(\d+\.\d+\.\d+\.\d+)\.\d+\]', 1, _Msg),
-            SrcPortNumber = tolong(extract(@'Peer\[\d+\.\d+\.\d+\.\d+\.(\d+)\]', 1, _Msg)),
+            SrcPortNumber = toint(extract(@'Peer\[\d+\.\d+\.\d+\.\d+\.(\d+)\]', 1, _Msg)),
             NetworkProtocol = toupper(extract(@'Prot\[(\w+)\]', 1, _Msg))
         | extend
             EventType    = 'NetworkSession',
