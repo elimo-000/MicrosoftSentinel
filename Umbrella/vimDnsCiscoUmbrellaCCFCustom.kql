@@ -3,7 +3,7 @@
 // =============================================================================================
 // Source table   : CiscoUmbrellaDNS_CL
 // Ingestion path : Cisco Umbrella data connector, Codeless Connector Framework (CCF) variant
-// Schema         : ASIM Dns, schema version 0.1.3 (verify against current docs at deploy time --
+// Schema         : ASIM Dns, schema version 1.0.0 (verify against current docs at deploy time --
 //                  https://learn.microsoft.com/azure/sentinel/normalization-schema-dns)
 //
 // WHY THIS PARSER EXISTS
@@ -14,6 +14,33 @@
 // tables (Cisco_Umbrella_dns_CL, Cisco_Umbrella_proxy_CL, ...) alongside the newer CCF tables,
 // but no ASIM-schema parser ships for the CCF connector's CiscoUmbrellaDNS_CL table at all.
 // This custom parser fills that gap for DNS data.
+//
+// FIELD MAPPING NOTES (confirmed against production CiscoUmbrellaDNS_CL samples)
+// -----------------------------------------------------------------------------------------
+// Uses extend + project-away instead of a hard project, so raw source columns (Identities,
+// IdentityTypes, Action, RuleId, DestinationCountries, OrganizationId, ...) survive in the
+// output alongside their ASIM-mapped names, instead of being silently dropped. Only pure
+// ingestion metadata with no analytic value is dropped (Timestamp once typed into
+// EventStartTime/EventEndTime, Type, TenantId, _ResourceId).
+//
+// - MostGranularIdentity/Identities are real client hostnames (e.g. "LTGV21-2014", confirmed
+//   via sample data), not an abstract identity label -> mapped to SrcHostname (Recommended).
+// - IdentityTypes/MostGranularIdentityType (e.g. "Anyconnect Roaming Client") has no reliable
+//   mapping to ASIM's fixed SrcDeviceType enum (Computer/Mobile Device/IOT Device/Other)
+//   without a vendor-wide lookup table covering every Umbrella identity type -> kept as free
+//   text in SrcDescription instead of force-fitting an enum.
+// - Action is raw vendor wording ("Allowed"/"Blocked"), which never equals ASIM's canonical
+//   DvcAction values ("Allow"/"Deny") -- any content filtering on DvcAction=="Allow" would
+//   silently never match this source. Normalized into DvcAction, with the raw value preserved
+//   in DvcOriginalAction.
+// - RuleId looks numeric in samples but kept as a string (RuleName) rather than cast with
+//   toint(), to avoid runtime errors if a future/non-standard deployment emits a non-numeric
+//   rule identifier.
+// - OrganizationId (Umbrella's own org/tenant ID for this deployment) -> DvcScopeId, analogous
+//   to how DvcScopeId maps a cloud subscription/account ID for other cloud-delivered sources.
+// - DestinationCountries -> DstGeoCountry; can be a comma-separated list when a response
+//   resolves to multiple IPs in different countries, which is a looser fit than the schema's
+//   single-country intent, but still far more useful than dropping the field entirely.
 // =============================================================================================
 let DNSQuery_CiscoUmbrella=(
   starttime:datetime=datetime(null), endtime:datetime=datetime(null)
@@ -40,40 +67,60 @@ let DNSQuery_CiscoUmbrella=(
     // *****************************************************************
     | parse QueryType with DnsQueryType:int " ("DnsQueryTypeName:string ")"
     //
-    | project
+    | extend
     //
     // ******************* Mandatory
- EventCount=int(1),
+      EventCount=int(1),
       EventStartTime=todatetime(column_ifexists('Timestamp', '')),
+      EventEndTime=todatetime(column_ifexists('Timestamp', '')),
       EventProduct="Umbrella",
       EventVendor="Cisco",
       EventSchema="Dns",
-      EventSchemaVersion="0.1.3",
+      EventSchemaVersion="1.0.0",
       Dvc="CiscoUmbrella" ,
       EventType="Query",
       EventResult=iff(ResponseCode=~'NOERROR','Success','Failure'),
       EventResultDetails=ResponseCode,  // => ResponseCodeNames
-      //
-      TimeGenerated, // not handled by schema, but we need to preserve it
+      EventSubType='response'
+  // ********** Recommended
+  | extend
       SrcIpAddr=tostring(column_ifexists('InternalIp', '')),
-      EventSubType='response',
-  // ********** Renamed columns
+      SrcHostname=tostring(column_ifexists('MostGranularIdentity', '')),
+      DvcAction=case(
+          Action =~ 'Allowed', 'Allow',
+          Action =~ 'Blocked', 'Deny',
+          tostring(column_ifexists('Action', ''))
+      )
+  // ********** Renamed / optional columns
+  | extend
       UrlCategory=column_ifexists('Categories', ''),
       DnsQuery=trim_end(@'\.',column_ifexists('Domain', '')) ,
       ThreatCategory=tostring(column_ifexists('BlockedCategories', '')),
       SrcNatIpAddr=column_ifexists('ExternalIp', ''),
-      DvcAction=column_ifexists('Action', ''),
-      EventEndTime=todatetime(column_ifexists('Timestamp', '')),
-  //
-  // *************** keep Parsed data
-      DnsQueryType, DnsQueryTypeName
+      SrcDescription=tostring(column_ifexists('MostGranularIdentityType', '')),
+      DvcOriginalAction=tostring(column_ifexists('Action', '')),
+      RuleName=tostring(column_ifexists('RuleId', '')),
+      DstGeoCountry=tostring(column_ifexists('DestinationCountries', '')),
+      DvcScopeId=tostring(column_ifexists('OrganizationId', ''))
+  // *************** AdditionalFields: full identity chain, in case it differs from the
+  // single most-granular identity captured above (e.g. a request attributed to more than
+  // one identity, such as a user behind a network device).
+  | extend AdditionalFields=bag_pack(
+        'Identities', column_ifexists('Identities', ''),
+        'IdentityTypes', column_ifexists('IdentityTypes', '')
+    )
   // **************Aliases
   | extend
       DnsResponseCodeName=EventResultDetails,
       DomainCategory=UrlCategory,
       Domain=DnsQuery,
       IpAddr=SrcIpAddr,
-      Src=SrcIpAddr
+      Src=SrcIpAddr,
+      Hostname=SrcHostname
+  // Drop pure ingestion metadata only -- every Cisco Umbrella field (Identities, IdentityTypes,
+  // Action, RuleId, DestinationCountries, OrganizationId, QueryType, ResponseCode, ...) is kept
+  // in the output alongside its ASIM-mapped name.
+  | project-away Timestamp, Type, TenantId, _ResourceId
   };
 DNSQuery_CiscoUmbrella( starttime, endtime, srcipaddr, domain_has_any, responsecodename, response_has_ipv4, response_has_any_prefix, eventtype, disabled)
 // -----------------------------------------------------------------------------------------
