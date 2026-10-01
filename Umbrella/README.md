@@ -31,7 +31,7 @@ data):
 
 | Raw field | ASIM field | Why |
 |---|---|---|
-| `MostGranularIdentity` | `SrcHostname` (Recommended) | Confirmed to be a real client hostname (e.g. `LTGV21-2014`), not an abstract label. |
+| `MostGranularIdentity` | `SrcHostname` (Recommended) | Confirmed to be a real client hostname (e.g. `CLT-201`), not an abstract label. |
 | `MostGranularIdentityType` | `SrcDescription` (Optional) | Free text (e.g. `Anyconnect Roaming Client`) — not mapped to `SrcDeviceType`, since Umbrella's identity types don't reliably map to ASIM's fixed enum (`Computer`/`Mobile Device`/`IOT Device`/`Other`) without a vendor-wide lookup table. |
 | `Action` | `DvcAction` (normalized: `Allowed`→`Allow`, `Blocked`→`Deny`) + `DvcOriginalAction` (raw) | Umbrella's raw wording never equals ASIM's canonical `Allow`/`Deny` — any content filtering on `DvcAction=="Allow"` previously never matched this source. |
 | `RuleId` | `RuleName` (Optional, string) | Kept as string rather than cast with `toint()`, in case a future/non-standard deployment emits a non-numeric rule ID. |
