@@ -16,23 +16,12 @@ analytics rules and workbooks built on `_Im_Dns()`/`_ASim_Dns()` see no
 Cisco Umbrella DNS data when the CCF connector is used instead of the
 Azure Function one.
 
-## Known inconsistency
-
-Unlike the other parsers in this repo (Meraki, pfSense, SonicWall), the
-parameterless `ASimDnsCiscoUmbrellaCCFCustom` does **not** call
-`vimDnsCiscoUmbrellaCCFCustom`. As deployed in the workspace it carries its
-own inline copy of the same parsing logic, exposing only the `disabled`
-parameter (no time range or filter parameters). Exported here exactly as
-saved — worth refactoring to a thin wrapper around
-`vimDnsCiscoUmbrellaCCFCustom` for consistency and to avoid the two copies
-drifting apart.
-
 ## Files
 
 | File | Purpose |
 |---|---|
 | `vimDnsCiscoUmbrellaCCFCustom.kql` / `.json` | Parameterized filtering parser — supports ASIM's standard Dns filter parameters (time range, source IP, domain, response code/IP filters). |
-| `ASimDnsCiscoUmbrellaCCFCustom.kql` / `.json` | Parameter-less wrapper, for tools/queries expecting a zero-argument view and for auto-discovery by `_ASim_Dns()`. See "Known inconsistency" above. |
+| `ASimDnsCiscoUmbrellaCCFCustom.kql` / `.json` | Thin wrapper around `vimDnsCiscoUmbrellaCCFCustom`, called with no-op filter values, keeping only the `disabled` parameter. For tools/queries expecting a (near-)zero-argument view and for auto-discovery by `_ASim_Dns()`. |
 
 ## Deployment
 
