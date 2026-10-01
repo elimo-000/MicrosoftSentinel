@@ -1,0 +1,89 @@
+// =============================================================================================
+// ASIM Dns Parser (parameter-based / "vim") -- Cisco Umbrella (Custom, CCF connector)
+// =============================================================================================
+// Source table   : CiscoUmbrellaDNS_CL
+// Ingestion path : Cisco Umbrella data connector, Codeless Connector Framework (CCF) variant
+// Schema         : ASIM Dns, schema version 0.1.3 (verify against current docs at deploy time --
+//                  https://learn.microsoft.com/azure/sentinel/normalization-schema-dns)
+//
+// WHY THIS PARSER EXISTS
+// -----------------------------------------------------------------------------------------
+// Microsoft's built-in "CiscoUmbrella Data Parser" (functionAlias Cisco_Umbrella) is a plain
+// union view, not an ASIM Dns parser -- it does not normalize to the Dns schema and is not
+// picked up by _ASim_Dns()/_Im_Dns(). It also still reads the legacy Azure-Function-connector
+// tables (Cisco_Umbrella_dns_CL, Cisco_Umbrella_proxy_CL, ...) alongside the newer CCF tables,
+// but no ASIM-schema parser ships for the CCF connector's CiscoUmbrellaDNS_CL table at all.
+// This custom parser fills that gap for DNS data.
+// =============================================================================================
+let DNSQuery_CiscoUmbrella=(
+  starttime:datetime=datetime(null), endtime:datetime=datetime(null)
+  , srcipaddr:string='*'
+  , domain_has_any:dynamic=dynamic([])
+  , responsecodename:string='*'
+  , response_has_ipv4:string='*' , response_has_any_prefix:dynamic=dynamic([])
+  , eventtype:string='Query'
+  , disabled:bool=false
+  ){
+    CiscoUmbrellaDNS_CL | where not(disabled)
+    // ******************************************************************
+    //  Pre-parsing filterring:
+      | where
+      // Return empty list if response IPs are passed
+        (eventtype in~ ('lookup','Query'))
+        and (response_has_ipv4=='*')
+        and (array_length(response_has_any_prefix) ==0)
+        and (isnull(starttime) or TimeGenerated >= starttime)
+        and (isnull(endtime) or TimeGenerated <= endtime)
+        and (srcipaddr=='*' or InternalIp==srcipaddr)
+        and (array_length(domain_has_any) ==0 or Domain has_any (domain_has_any))
+        and (responsecodename=='*' or ResponseCode=~responsecodename)
+    // *****************************************************************
+    | parse QueryType with DnsQueryType:int " ("DnsQueryTypeName:string ")"
+    //
+    | project
+    //
+    // ******************* Mandatory
+ EventCount=int(1),
+      EventStartTime=todatetime(column_ifexists('Timestamp', '')),
+      EventProduct="Umbrella",
+      EventVendor="Cisco",
+      EventSchema="Dns",
+      EventSchemaVersion="0.1.3",
+      Dvc="CiscoUmbrella" ,
+      EventType="Query",
+      EventResult=iff(ResponseCode=~'NOERROR','Success','Failure'),
+      EventResultDetails=ResponseCode,  // => ResponseCodeNames
+      //
+      TimeGenerated, // not handled by schema, but we need to preserve it
+      SrcIpAddr=tostring(column_ifexists('InternalIp', '')),
+      EventSubType='response',
+  // ********** Renamed columns
+      UrlCategory=column_ifexists('Categories', ''),
+      DnsQuery=trim_end(@'\.',column_ifexists('Domain', '')) ,
+      ThreatCategory=tostring(column_ifexists('BlockedCategories', '')),
+      SrcNatIpAddr=column_ifexists('ExternalIp', ''),
+      DvcAction=column_ifexists('Action', ''),
+      EventEndTime=todatetime(column_ifexists('Timestamp', '')),
+  //
+  // *************** keep Parsed data
+      DnsQueryType, DnsQueryTypeName
+  // **************Aliases
+  | extend
+      DnsResponseCodeName=EventResultDetails,
+      DomainCategory=UrlCategory,
+      Domain=DnsQuery,
+      IpAddr=SrcIpAddr,
+      Src=SrcIpAddr
+  };
+DNSQuery_CiscoUmbrella( starttime, endtime, srcipaddr, domain_has_any, responsecodename, response_has_ipv4, response_has_any_prefix, eventtype, disabled)
+// -----------------------------------------------------------------------------------------
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Paste this entire file into Log Analytics / Microsoft Sentinel > Logs.
+// 2. Run it once with a test call appended, e.g.:
+//        DNSQuery_CiscoUmbrella(ago(1d), now(), '*', dynamic([]), '*', '*', dynamic([]), 'Query', false)
+//    to confirm it returns rows.
+// 3. Remove the test call, then use "Save as Function", name it exactly
+//    vimDnsCiscoUmbrellaCCFCustom, and keep the parameter list as-is.
+// 4. Register this name in the workspace-deployed Im_DnsCustom function's "Custom" slot
+//    so _Im_Dns() and ASIM-based analytics/workbooks pick it up automatically.

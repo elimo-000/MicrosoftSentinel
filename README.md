@@ -6,9 +6,9 @@ to fix a built-in parser's bug.
 
 | Folder | What it's for |
 |---|---|
-| [`Meraki/`](Meraki) | Custom ASIM Network Session parser for Cisco Meraki MX, built for the `meraki_CL` custom table (Custom Logs via AMA), since none of Microsoft's published Meraki parsers read that table or carry flow/firewall data. |
 | [`Pfsense/`](Pfsense) | Custom ASIM Network Session parser for Netgate pfSense, plus the rsyslog config that reshapes pfSense's `filterlog` into the CEF fields the parser expects. |
 | [`SonicWall/`](SonicWall) | Custom ASIM Network Session parser — a patched copy of Microsoft's built-in SonicWall parser, fixing several bugs (including one that silently dropped allowed/forwarded traffic records) found during investigation, plus the investigation notes themselves. |
+| [`Umbrella/`](Umbrella) | Custom ASIM Dns parser for Cisco Umbrella via the CCF (Codeless Connector Framework) connector, built for the `CiscoUmbrellaDNS_CL` table, since Microsoft's built-in Umbrella parser doesn't normalize to any ASIM schema. |
 
 Each parser ships as a matching pair of files:
 - **`.kql`** — the raw query, for pasting into Log Analytics / Sentinel Logs to test before saving as a function.
