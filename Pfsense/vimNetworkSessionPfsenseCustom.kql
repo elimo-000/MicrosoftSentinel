@@ -1,4 +1,57 @@
-let vimNetworkSessionPfsense = (
+// =============================================================================================
+// ASIM NetworkSession Parser (parameter-based / "vim") -- Netgate pfSense filterlog (Custom, CEF)
+// =============================================================================================
+// Source table   : CommonSecurityLog (DeviceVendor NETGATE / DeviceProduct pfsense / filterlog)
+// Ingestion path : pfSense -> rsyslog reshaping into CEF (PFsense_Rsyslog_Conf_CEF_Sentinel_Schema.conf)
+//                  -> Azure Monitor Agent -> CommonSecurityLog
+// Schema         : ASIM NetworkSession, schema version 1.0.0
+//
+// LEGACY PATH: kept (and fixed) while devices migrate to the raw Syslog path
+// (vimNetworkSessionPfsenseSyslogCustom). Never register both parsers for the same device.
+//
+// NOTES
+// - Non-standard CEF keys (trackerid, ipversion, tcpflags, icmptype, ...) land in
+//   AdditionalExtensions, which AMA joins with ";" -- e.g. "trackerid=1000000103;ipversion=4;
+//   ...;options=nop nop TS;...". Values are therefore extracted with "key=([^;]*)": a previous
+//   version used "key=([^\s]+)", which captured the whole remainder of the string.
+// - SourceIP/DestinationIP are empty on IPv6 rows; the IPv6 addresses are in
+//   DeviceCustomIPv6Address1/2 (c6a1/c6a2). coalesce() skips empty strings, so it falls through.
+// - NetworkDirection is derived from the address scopes (local/public), NOT from pf's
+//   per-interface in/out (CommunicationDirection 0/1, kept in AdditionalFields.PfDirection);
+//   pf's in/out only decides when both ends are public (e.g. scans of the WAN address).
+// - NetworkRuleName = pf tracker ID (stable across rule reordering); NetworkRuleNumber = cs1.
+// - EventResultDetails is an enumeration in the schema -> "NA"; pf's reason goes to
+//   EventOriginalResultDetails.
+// - IPv6 rows may report an extension header (e.g. "Options") instead of the transport protocol
+//   -- a known pfSense filterlog decoding limitation, passed through as-is.
+// =============================================================================================
+let LocalV4Ranges = dynamic(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+    "169.254.0.0/16", "127.0.0.0/8", "224.0.0.0/4", "255.255.255.255/32"]);
+let LocalV6Regex = @"(?i)^(f[cd]|fe[89ab]|ff|::1$)";
+let IcmpLookup = datatable(_IpVer:string, _IcmpText:string, NetworkIcmpType:string, NetworkIcmpCode:int, _IcmpSubCode:int)[
+    "4", "request",      "Echo Request",            8,  int(null),
+    "4", "reply",        "Echo Reply",              0,  int(null),
+    "4", "unreach",      "Destination Unreachable", 3,  int(null),
+    "4", "unreachproto", "Destination Unreachable", 3,  2,
+    "4", "unreachport",  "Destination Unreachable", 3,  3,
+    "4", "needfrag",     "Destination Unreachable", 3,  4,
+    "4", "redirect",     "Redirect",                5,  int(null),
+    "4", "timexceed",    "Time Exceeded",           11, int(null),
+    "4", "paramprob",    "Parameter Problem",       12, int(null),
+    "4", "tstamp",       "Timestamp",               13, int(null),
+    "4", "tstampreply",  "Timestamp Reply",         14, int(null),
+    "4", "maskreq",      "Address Mask Request",    17, int(null),
+    "4", "maskreply",    "Address Mask Reply",      18, int(null),
+    "6", "request",      "Echo Request",            128, int(null),
+    "6", "reply",        "Echo Reply",              129, int(null),
+    "6", "unreach",      "Destination Unreachable", 1,  int(null),
+    "6", "unreachport",  "Destination Unreachable", 1,  4,
+    "6", "needfrag",     "Packet Too Big",          2,  int(null),
+    "6", "timexceed",    "Time Exceeded",           3,  int(null),
+    "6", "paramprob",    "Parameter Problem",       4,  int(null),
+    "6", "redirect",     "Redirect Message",        137, int(null)
+];
+let NetworkSessionPfsenseCef = (
     starttime:datetime = datetime(null),
     endtime:datetime = datetime(null),
     srcipaddr_has_any_prefix:dynamic = dynamic([]),
@@ -11,147 +64,140 @@ let vimNetworkSessionPfsense = (
     disabled:bool = false
 )
 {
+    let src_or_any = set_union(srcipaddr_has_any_prefix, ipaddr_has_any_prefix);
+    let dst_or_any = set_union(dstipaddr_has_any_prefix, ipaddr_has_any_prefix);
     CommonSecurityLog
     | where not(disabled)
+    // pfSense filterlog carries no Src/Dst hostnames -> a hostname filter can never match
+    | where array_length(hostname_has_any) == 0
+    | where (isnull(starttime) or TimeGenerated >= starttime)
+        and (isnull(endtime) or TimeGenerated <= endtime)
     | where DeviceVendor == "NETGATE"
         and DeviceProduct == "pfsense"
         and DeviceEventClassID == "filterlog"
-    | where isnull(starttime) or TimeGenerated >= starttime
-    | where isnull(endtime) or TimeGenerated <= endtime
-    // Filter on raw fields first, before the normalization work below, so
-    // non-matching rows are dropped as cheaply as possible.
+    // raw-column filters first, before the normalization work below
     | where isnull(dstportnumber) or DestinationPort == dstportnumber
-    | where array_length(hostname_has_any) == 0
-        or DeviceName has_any (hostname_has_any)
-        or Computer has_any (hostname_has_any)
-    | where array_length(dvcaction) == 0
-        or DeviceAction has_any (dvcaction)
-    // IPv4 / IPv6 address resolution.
-    // Fix: src/dst -> SourceIP/DestinationIP come through as an EMPTY STRING
-    // (not null) on IPv6 rows in this CEF template, because the rsyslog
-    // template always emits src=/dst= even when $!srcip/$!dstip were never
-    // set. coalesce() only falls through on null, so the previous version
-    // never actually reached the c6a1/c6a2 IPv6 fields -- every IPv6 session
-    // ended up with a blank SrcIpAddr/DstIpAddr. Use isnotempty() instead.
     | extend
-        SrcIpAddr = iff(isnotempty(SourceIP), tostring(SourceIP), tostring(column_ifexists("DeviceCustomIPv6Address1", ""))),
-        DstIpAddr = iff(isnotempty(DestinationIP), tostring(DestinationIP), tostring(column_ifexists("DeviceCustomIPv6Address2", "")))
-    | where array_length(srcipaddr_has_any_prefix) == 0
-        or SrcIpAddr has_any (srcipaddr_has_any_prefix)
-    | where array_length(dstipaddr_has_any_prefix) == 0
-        or DstIpAddr has_any (dstipaddr_has_any_prefix)
-    | where array_length(ipaddr_has_any_prefix) == 0
-        or SrcIpAddr has_any (ipaddr_has_any_prefix)
-        or DstIpAddr has_any (ipaddr_has_any_prefix)
-    // Core field normalization.
+        SrcIpAddr = coalesce(SourceIP, tostring(column_ifexists("DeviceCustomIPv6Address1", ""))),
+        DstIpAddr = coalesce(DestinationIP, tostring(column_ifexists("DeviceCustomIPv6Address2", "")))
     | extend
-        SrcPortNumber = toint(SourcePort),
-        DstPortNumber = toint(DestinationPort),
-        NetworkProtocol = toupper(tostring(Protocol)),
-        EventOriginalType = tostring(DeviceEventClassID),
-        EventOriginalSubType = tostring(Activity),
-        // Fix: the raw pre-normalized action belongs in DvcOriginalAction,
-        // not EventOriginalResultDetails (that field feeds EventResultDetails,
-        // a different concept -- see below).
-        DvcOriginalAction = tostring(DeviceAction),
-        EventOriginalResultDetails = tostring(Reason),
-        EventOriginalSeverity = tostring(LogSeverity),
-        DvcInboundInterface = tostring(DeviceInboundInterface),
-        DvcOutboundInterface = tostring(DeviceOutboundInterface),
-        EventMessage = tostring(Reason),
-        DvcHostname = coalesce(tostring(DeviceName), tostring(Computer)),
-        Dvc = coalesce(tostring(DeviceName), tostring(Computer), tostring(DeviceAddress)),
-        CompanyResourceId = tostring(column_ifexists("_ResourceId", ""))
-    // Rule identity.
-    // Fix: "Rule"/"RuleLabel" aren't ASIM NetworkSession fields. The schema
-    // defines NetworkRuleNumber (int) and NetworkRuleName (string).
-    // NetworkRuleNumber = pf's rule ordinal position (cs1).
-    // NetworkRuleName = pf's trackerid, extracted from AdditionalExtensions
-    // (it's a non-standard CEF key, so it doesn't get its own column). Unlike
-    // the ordinal rule number, trackerid stays stable if rules get reordered,
-    // so it's the better field to key hunts/detections on.
+        _SrcMatch = array_length(src_or_any) > 0 and has_any_ipv4_prefix(SrcIpAddr, src_or_any),
+        _DstMatch = array_length(dst_or_any) > 0 and has_any_ipv4_prefix(DstIpAddr, dst_or_any)
+    | where (array_length(srcipaddr_has_any_prefix) == 0 or has_any_ipv4_prefix(SrcIpAddr, srcipaddr_has_any_prefix))
+        and (array_length(dstipaddr_has_any_prefix) == 0 or has_any_ipv4_prefix(DstIpAddr, dstipaddr_has_any_prefix))
+        and (array_length(ipaddr_has_any_prefix) == 0 or _SrcMatch or _DstMatch)
+    | extend ASimMatchingIpAddr = case(
+        array_length(ipaddr_has_any_prefix) == 0, "-",
+        _SrcMatch and _DstMatch, "Both",
+        _SrcMatch, "SrcIpAddr",
+        _DstMatch, "DstIpAddr",
+        "No match")
+    // ---------------------------------------------------------------- action / result
+    | extend DvcOriginalAction = tostring(DeviceAction)
+    | extend DvcAction = case(
+        DvcOriginalAction =~ "pass", "Allow",
+        DvcOriginalAction in~ ("block", "reject"), "Deny",
+        DvcOriginalAction)
+    | where array_length(dvcaction) == 0 or DvcAction in~ (dvcaction)
+    | extend EventResult = iff(DvcAction == "Allow", "Success", "Failure")
+    | where eventresult == '*' or EventResult =~ eventresult
+    | extend
+        EventSeverity = iff(DvcAction == "Allow", "Informational", "Low"),
+        EventResultDetails = "NA",
+        EventOriginalResultDetails = tostring(Reason)
+    // ---------------------------------------------------------------- non-standard CEF keys
+    | extend
+        NetworkRuleName = extract(@"(?:^|;)trackerid=([^;]*)", 1, AdditionalExtensions),
+        _IpVer = extract(@"(?:^|;)ipversion=([^;]*)", 1, AdditionalExtensions),
+        _TcpFlags = extract(@"(?:^|;)tcpflags=([^;]*)", 1, AdditionalExtensions),
+        _IcmpText = extract(@"(?:^|;)icmptype=([^;]*)", 1, AdditionalExtensions),
+        _PayloadBytes = tolong(extract(@"(?:^|;)payloadbytes=([^;]*)", 1, AdditionalExtensions))
+    // ---------------------------------------------------------------- network fields
     | extend
         NetworkRuleNumber = toint(DeviceCustomString1),
-        NetworkRuleName = extract(@'trackerid=([^\s]+)', 1, AdditionalExtensions)
-    // Bytes.
-    // Fix: byte counts weren't surfaced into ASIM at all before. pf logs one
-    // packet per line, in only one direction at a time (in= OR out=, never
-    // both), so there's no reliable per-session Src/Dst split available --
-    // only the total for this logged packet is meaningful here.
+        NetworkProtocol = toupper(tostring(Protocol)),
+        NetworkProtocolVersion = case(_IpVer == "4", "IPv4", _IpVer == "6", "IPv6", ""),
+        NetworkBytes = tolong(coalesce(ReceivedBytes, SentBytes)),
+        NetworkPackets = long(1),
+        SrcPortNumber = toint(SourcePort),
+        DstPortNumber = toint(DestinationPort),
+        DvcInboundInterface = tostring(DeviceInboundInterface),
+        DvcOutboundInterface = tostring(DeviceOutboundInterface),
+        DvcInterface = coalesce(DeviceInboundInterface, DeviceOutboundInterface)
     | extend
-        NetworkBytes = toint(coalesce(ReceivedBytes, SentBytes))
-    // ICMP type (best-effort text extraction from AdditionalExtensions).
-    // pf doesn't expose the raw numeric RFC792/RFC4443 type, only a text
-    // category (request/reply/unreachproto/...), so NetworkIcmpCode is left
-    // unset -- only NetworkIcmpType is populated.
+        _V4 = _IpVer == "4" or isnotnull(parse_ipv4(SrcIpAddr)),
+        _PfDirection = case(CommunicationDirection == "0", "in", CommunicationDirection == "1", "out", tostring(CommunicationDirection))
+    // Direction from address scopes: "local" = RFC 1918, CGNAT, link-local, loopback, multicast,
+    // broadcast (IPv4) / ULA, link-local, multicast, loopback (IPv6). When both ends are public
+    // (typically traffic to/from the firewall's own public WAN address) fall back to pf's direction.
     | extend
-        NetworkIcmpType = iff(NetworkProtocol in ("ICMP", "ICMPV6"),
-            extract(@'icmptype=([^\s]+)', 1, AdditionalExtensions), "")
-
-    // Normalize firewall action to the ASIM controlled vocabulary.
+        _SrcLocal = iff(_V4, ipv4_is_in_any_range(SrcIpAddr, LocalV4Ranges), SrcIpAddr matches regex LocalV6Regex),
+        _DstLocal = iff(_V4, ipv4_is_in_any_range(DstIpAddr, LocalV4Ranges), DstIpAddr matches regex LocalV6Regex)
+    | extend NetworkDirection = case(
+        _SrcLocal and _DstLocal, "Local",
+        _SrcLocal, "Outbound",
+        _DstLocal, "Inbound",
+        _PfDirection == "in", "Inbound",
+        _PfDirection == "out", "Outbound",
+        "External")
     | extend
-        DvcAction = case(
-            DeviceAction in~ ("pass", "allow", "allowed", "accept"), "Allow",
-            DeviceAction in~ ("block", "deny", "denied", "drop", "dropped", "reject"), "Deny",
-            tostring(DeviceAction)
-        )
-
-    // Direction. This reflects pf's single-interface ifdir (in/out), not
-    // necessarily true network-level directionality relative to a trust zone
-    // -- treat as best-effort, the same caveat that applies to other
-    // CEF-sourced ASIM Network Session parsers.
+        _IsTcp = NetworkProtocol == "TCP"
     | extend
-        NetworkDirection = case(
-            CommunicationDirection == "0" or CommunicationDirection =~ "Inbound" or CommunicationDirection =~ "in", "Inbound",
-            CommunicationDirection == "1" or CommunicationDirection =~ "Outbound" or CommunicationDirection =~ "out", "Outbound",
-            ""
-        )
-    // Result and severity.
-    // Fix: EventResult was hardcoded to "Success" for every row, including
-    // blocked/denied traffic -- this would have broken any rule/workbook that
-    // filters on result. Both are now derived from the normalized action
-    // rather than from the raw numeric CEF severity (3/5), since those don't
-    // map cleanly onto ASIM's Informational/Low/Medium/High buckets for a
-    // simple pass/block source. EventSeverity was also previously missing.
+        TcpFlagsSyn = iff(_IsTcp, _TcpFlags contains_cs "S", bool(null)),
+        TcpFlagsAck = iff(_IsTcp, _TcpFlags contains_cs "A", bool(null)),
+        TcpFlagsFin = iff(_IsTcp, _TcpFlags contains_cs "F", bool(null)),
+        TcpFlagsRst = iff(_IsTcp, _TcpFlags contains_cs "R", bool(null)),
+        TcpFlagsPsh = iff(_IsTcp, _TcpFlags contains_cs "P", bool(null)),
+        TcpFlagsUrg = iff(_IsTcp, _TcpFlags contains_cs "U", bool(null)),
+        TcpFlagsEce = iff(_IsTcp, _TcpFlags contains_cs "E", bool(null)),
+        TcpFlagsCwr = iff(_IsTcp, _TcpFlags contains_cs "W", bool(null))
+    | lookup kind=leftouter IcmpLookup on _IpVer, _IcmpText
+    // ---------------------------------------------------------------- device (reporting firewall)
+    | extend _HostIsIp = isnotnull(parse_ipv4(DeviceName)) or isnotempty(parse_ipv6(DeviceName))
     | extend
-        EventResult = iff(DvcAction == "Allow", "Success", "Failure"),
-        EventResultDetails = tostring(Reason),
-        EventSeverity = iff(DvcAction == "Allow", "Informational", "Low")
-    // ASIM core fields.
+        Dvc = coalesce(DeviceName, DeviceAddress),
+        DvcHostname = iff(_HostIsIp, "", tostring(split(DeviceName, ".")[0])),
+        DvcFQDN = iff(_HostIsIp or DeviceName !contains ".", "", tostring(DeviceName)),
+        DvcIpAddr = tostring(DeviceAddress)
     | extend
-        EventSchema = "NetworkSession",
-        EventSchemaVersion = "0.2.7",
+        DvcDomain = iff(isnotempty(DvcFQDN), substring(DvcFQDN, strlen(DvcHostname) + 1), ""),
+        DvcDomainType = iff(isnotempty(DvcFQDN), "FQDN", "")
+    // ---------------------------------------------------------------- common ASIM fields
+    | extend
+        EventCount = toint(coalesce(EventCount, 1)),
+        EventStartTime = TimeGenerated,
+        EventEndTime = TimeGenerated,
         EventType = "NetworkSession",
         EventVendor = "Netgate",
         EventProduct = "pfSense",
-        EventCount = toint(coalesce(EventCount, 1)),
-        EventStartTime = TimeGenerated,
-        EventEndTime = TimeGenerated
-
-    // Aliases commonly expected by ASIM-style content.
+        EventSchema = "NetworkSession",
+        EventSchemaVersion = "1.0.0",
+        EventOriginalType = tostring(DeviceEventClassID),
+        EventOriginalSubType = tostring(Activity),
+        EventOriginalSeverity = tostring(LogSeverity),
+        AdditionalFields = bag_pack(
+            "PfDirection", _PfDirection,
+            "Reason", tostring(Reason),
+            "PayloadBytes", _PayloadBytes,
+            "TcpFlags", _TcpFlags,
+            "IcmpText", _IcmpText,
+            "IcmpSubCode", _IcmpSubCode)
+    // ---------------------------------------------------------------- aliases
     | extend
         Src = SrcIpAddr,
         Dst = DstIpAddr,
         IpAddr = SrcIpAddr,
-        DvcId = coalesce(CompanyResourceId, tostring(DeviceExternalID), Dvc),
-        DvcIdType = iff(isnotempty(CompanyResourceId), "AzureResourceId", "")
-
-    | where eventresult == "*"
-        or EventResult =~ eventresult
-
-    // Keep _ResourceId. Do not project it away in your company fork.
-    | project-away
-        SourceSystem
+        Rule = coalesce(NetworkRuleName, tostring(NetworkRuleNumber))
+    | project-away _SrcMatch, _DstMatch, _IpVer, _TcpFlags, _IcmpText, _IcmpSubCode, _PayloadBytes, _V4, _PfDirection,
+        _SrcLocal, _DstLocal, _IsTcp, _HostIsIp, SourceSystem
 };
-vimNetworkSessionPfsense(
-    starttime,
-    endtime,
-    srcipaddr_has_any_prefix,
-    dstipaddr_has_any_prefix,
-    ipaddr_has_any_prefix,
-    dstportnumber,
-    hostname_has_any,
-    dvcaction,
-    eventresult,
-    disabled
-)
+NetworkSessionPfsenseCef(starttime, endtime, srcipaddr_has_any_prefix, dstipaddr_has_any_prefix, ipaddr_has_any_prefix, dstportnumber, hostname_has_any, dvcaction, eventresult, disabled)
+// -----------------------------------------------------------------------------------------
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Paste this file into Log Analytics / Microsoft Sentinel > Logs, replacing the last line with
+//        NetworkSessionPfsenseCef(ago(1h), now())
+//    to confirm it returns rows.
+// 2. Restore the last line, "Save as Function", name it exactly vimNetworkSessionPfsenseCustom,
+//    and keep the parameter list as-is (or deploy vimNetworkSessionPfsenseCustom.json).
+// 3. Register it in the workspace-deployed Im_NetworkSessionCustom "Custom" slot.

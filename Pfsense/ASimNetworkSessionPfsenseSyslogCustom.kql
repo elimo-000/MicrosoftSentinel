@@ -1,0 +1,38 @@
+// =============================================================================================
+// ASIM NetworkSession Parser (parameter-less / "ASim") -- Netgate pfSense filterlog (Custom, raw Syslog)
+// =============================================================================================
+// Thin wrapper around vimNetworkSessionPfsenseSyslogCustom, called with no-op filter values.
+// This is the standard ASIM parameterless-parser pattern: it exists so tools/queries that expect
+// a (near-)zero-argument view of the schema have something to call directly, and so it can be
+// registered for auto-discovery by _ASim_NetworkSession().
+//
+// DEPENDENCY: vimNetworkSessionPfsenseSyslogCustom must already be saved as a function in this
+// workspace before saving this one -- deploy vimNetworkSessionPfsenseSyslogCustom.kql first.
+//
+// Source table   : Syslog (raw pfSense path with the "[pfsense]" marker)
+// Schema         : ASIM NetworkSession, schema version 1.0.0
+//
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Confirm vimNetworkSessionPfsenseSyslogCustom is already saved as a function.
+// 2. Paste this file into Log Analytics / Microsoft Sentinel > Logs and run it to confirm
+//    it returns rows.
+// 3. "Save as Function", name it exactly ASimNetworkSessionPfsenseSyslogCustom.
+// 4. Register this name in the workspace-deployed ASim_NetworkSessionCustom "Custom" slot --
+//    only once no device feeds both the CEF and the raw Syslog path (double counting).
+// =============================================================================================
+let ASimNetworkSessionPfsenseSyslogCustom = (disabled:bool=false) {
+    vimNetworkSessionPfsenseSyslogCustom(
+        starttime = datetime(null),
+        endtime = datetime(null),
+        srcipaddr_has_any_prefix = dynamic([]),
+        dstipaddr_has_any_prefix = dynamic([]),
+        ipaddr_has_any_prefix = dynamic([]),
+        dstportnumber = int(null),
+        hostname_has_any = dynamic([]),
+        dvcaction = dynamic([]),
+        eventresult = '*',
+        disabled = disabled
+    )
+};
+ASimNetworkSessionPfsenseSyslogCustom(disabled)

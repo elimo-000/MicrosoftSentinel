@@ -1,0 +1,223 @@
+// =============================================================================================
+// ASIM Authentication Parser (parameter-based / "vim") -- Netgate pfSense (Custom, raw Syslog)
+// =============================================================================================
+// Source table   : Syslog
+// Ingestion path : pfSense -> rsyslog collector dedicated port (PFsense_Rsyslog_Conf_Raw_Syslog.conf)
+//                  -> static "[pfsense]" marker -> Azure Monitor Agent -> Syslog
+// Schema         : ASIM Authentication, schema version 1.0.0 (verify against current docs at deploy
+//                  time -- https://learn.microsoft.com/azure/sentinel/normalization-schema-authentication)
+//
+// SOURCE SELECTION
+// -----------------------------------------------------------------------------------------
+// pfSense rows are identified by the static marker the rsyslog ruleset prepends to every message
+// received on the dedicated pfSense port (SyslogMessage startswith "[pfsense]") plus ProcessName.
+// No hostname naming convention or IP list is used. Change PfsenseMarker below if your rsyslog
+// template uses a different marker.
+//
+// EVENTS MAPPED (only message shapes observed in production pfSense data are mapped; any other
+// line is dropped, never guessed)
+// -----------------------------------------------------------------------------------------
+//  sshd     "Accepted <method> for <user> from <ip> port <port> ssh2"            Logon  / Success
+//           "Failed <method> for [invalid user ]<user> from <ip> port <port>"    Logon  / Failure
+//           "Disconnected from user <user> <ip> port <port>"                     Logoff / Success
+//  php-fpm  "/<page>.php: Successful login for user '<user>' from: <ip> (<authsrc>)"     Logon / Success
+//           "/<page>.php: webConfigurator authentication error for user '<user>' from: <ip>" Logon / Failure
+//           "NOTICE [OpenVPN] user '<user>' authenticated"                       Logon  / Success (OpenVPN)
+//  openvpn  "user '<user>' authenticated"                                        Logon  / Success
+//           "user '<user>' could not authenticate."                             Logon  / Failure
+//           "openvpn server '<srv>' user cert CN '<cn>' address '<ip>[:<port>]' - connected"  Logon / Success (PKI)
+//           "openvpn server '<srv>' user [cert CN ]'<user>' address '<ip>[:<port>]' - disconnected" Logoff
+//
+// Deliberately NOT mapped (would double-count the events above):
+//  - sshd "Invalid user <u> from <ip>"  -> always followed by "Failed ... for invalid user <u> ..."
+//  - sshd "error: PAM: Authentication error for <u> from <ip>" -> accompanies a "Failed ..." line
+//  - openvpn "user '<u>' address ... - connected" for username/password users -> same logon as
+//    "user '<u>' authenticated" (which is the more complete signal: some devices never log the
+//    connected line). Only certificate-only clients ("user cert CN") use the connected line.
+//  - openvpn "Error during RADIUS authentication" / "TLS Auth Error ... verification failed" ->
+//    infrastructure errors accompanying "could not authenticate", no reliable user.
+//
+// "message repeated N times: [ ... ]" lines (syslogd de-duplication) are unwrapped and N is
+// carried into EventCount.
+// =============================================================================================
+let PfsenseMarker = "[pfsense]";
+let SshMethodLookup = datatable(SshMethod:string, LogonMethod:string)[
+    "password", "Username & Password",
+    "keyboard-interactive/pam", "PAM",
+    "publickey", "PKI"
+];
+let AuthenticationPfsense = (
+    starttime:datetime = datetime(null),
+    endtime:datetime = datetime(null),
+    username_has_any:dynamic = dynamic([]),
+    targetappname_has_any:dynamic = dynamic([]),
+    srcipaddr_has_any_prefix:dynamic = dynamic([]),
+    srchostname_has_any:dynamic = dynamic([]),
+    eventtype_in:dynamic = dynamic([]),
+    eventresultdetails_in:dynamic = dynamic([]),
+    eventresult:string = '*',
+    disabled:bool = false
+)
+{
+    let Base = Syslog
+        | where not(disabled)
+        // pfSense never reports a source hostname -> a source-hostname filter can't match
+        | where array_length(srchostname_has_any) == 0
+        | where (isnull(starttime) or TimeGenerated >= starttime)
+            and (isnull(endtime) or TimeGenerated <= endtime)
+        | where ProcessName in ("sshd", "sshd-session", "php-fpm", "openvpn")
+        | where SyslogMessage startswith PfsenseMarker
+        // cheap term pre-filter before any string work
+        | where SyslogMessage has_any ("Accepted", "Failed", "Disconnected", "Successful", "authentication", "authenticated", "authenticate", "connected", "disconnected")
+        | where array_length(username_has_any) == 0 or SyslogMessage has_any (username_has_any)
+        | extend _Msg = trim(@"\s+", substring(SyslogMessage, strlen(PfsenseMarker)))
+        // unwrap syslogd "message repeated N times: [ ... ]"
+        | extend _Repeat = toint(extract(@"^message repeated (\d+) times: \[", 1, _Msg))
+        | extend
+            EventCount = iff(isnotnull(_Repeat), _Repeat, int(1)),
+            _Msg = iff(isnotnull(_Repeat), trim(@"\s+", extract(@"^message repeated \d+ times: \[(.*?)\]?\s*$", 1, _Msg)), _Msg);
+    // ---------------------------------------------------------------- sshd
+    let Ssh = Base
+        | where ProcessName in ("sshd", "sshd-session")
+        | extend
+            _SshAcc = extract_all(@"^Accepted (\S+) for (\S+) from (\S+) port (\d+)", _Msg),
+            _SshFail = extract_all(@"^Failed (\S+) for (invalid user )?(\S+) from (\S+) port (\d+)", _Msg),
+            _SshDisc = extract_all(@"^Disconnected from user (\S+) (\S+) port (\d+)", _Msg)
+        | where isnotempty(_SshAcc) or isnotempty(_SshFail) or isnotempty(_SshDisc)
+        | extend
+            EventType = iff(isnotempty(_SshDisc), "Logoff", "Logon"),
+            EventResult = iff(isnotempty(_SshFail), "Failure", "Success"),
+            SshMethod = coalesce(tostring(_SshAcc[0][0]), tostring(_SshFail[0][0])),
+            TargetUsername = coalesce(tostring(_SshAcc[0][1]), tostring(_SshFail[0][2]), tostring(_SshDisc[0][0])),
+            SrcIpAddr = coalesce(tostring(_SshAcc[0][2]), tostring(_SshFail[0][3]), tostring(_SshDisc[0][1])),
+            SrcPortNumber = toint(coalesce(tostring(_SshAcc[0][3]), tostring(_SshFail[0][4]), tostring(_SshDisc[0][2]))),
+            _InvalidUser = isnotempty(tostring(_SshFail[0][1]))
+        | lookup kind=leftouter SshMethodLookup on SshMethod
+        | extend
+            EventResultDetails = case(
+                EventResult == "Success", "",
+                _InvalidUser, "No such user",
+                SshMethod == "publickey", "Incorrect key",
+                "Incorrect password"),
+            EventOriginalResultDetails = iff(EventResult == "Failure", _Msg, ""),
+            LogonMethod = coalesce(LogonMethod, iff(isnotempty(SshMethod), "Other", "")),
+            TargetAppName = "SSH",
+            LogonProtocol = "SSH",
+            EventSubType = "RemoteInteractive";
+    // ---------------------------------------------------------------- WebGUI (php-fpm)
+    let WebGui = Base
+        | where ProcessName == "php-fpm"
+        | extend
+            _WebOk = extract_all(@"^(\S+): Successful login for user '([^']*)' from: (\S+)(?: \((.*)\))?", _Msg),
+            _WebErr = extract_all(@"^(\S+): webConfigurator authentication error for user '([^']*)' from: (\S+)", _Msg)
+        | where isnotempty(_WebOk) or isnotempty(_WebErr)
+        | extend
+            EventType = "Logon",
+            EventResult = iff(isnotempty(_WebOk), "Success", "Failure"),
+            TargetUsername = coalesce(tostring(_WebOk[0][1]), tostring(_WebErr[0][1])),
+            SrcIpAddr = coalesce(tostring(_WebOk[0][2]), tostring(_WebErr[0][2])),
+            TargetUrl = coalesce(tostring(_WebOk[0][0]), tostring(_WebErr[0][0])),
+            _AuthSource = tostring(_WebOk[0][3])
+        | extend
+            EventResultDetails = iff(EventResult == "Failure", "No such user or password", ""),
+            EventOriginalResultDetails = iff(EventResult == "Failure", _Msg, ""),
+            LogonMethod = "Username & Password",
+            TargetAppName = "pfSense WebGUI",
+            LogonProtocol = "HTTPS",
+            EventSubType = "Remote";
+    // ---------------------------------------------------------------- OpenVPN (openvpn + php-fpm notice)
+    let OpenVpn = Base
+        | where ProcessName in ("openvpn", "php-fpm")
+        | extend
+            _VpnOk = extract(@"^(?:NOTICE \[OpenVPN\] )?user '([^']*)' authenticated", 1, _Msg),
+            _VpnFail = extract(@"^user '([^']*)' could not authenticate", 1, _Msg),
+            _VpnSess = extract_all(@"^openvpn server '([^']*)' user (cert CN )?'([^']*)' address '([^']*)' - (connected|disconnected)", _Msg)
+        | extend
+            _SessState = tostring(_VpnSess[0][4]),
+            _IsCert = isnotempty(tostring(_VpnSess[0][1]))
+        // logon via "authenticated"/"could not authenticate"; session lines only for cert-only
+        // connects and for every disconnect (see header)
+        | where isnotempty(_VpnOk) or isnotempty(_VpnFail)
+            or (_SessState == "connected" and _IsCert)
+            or _SessState == "disconnected"
+        | where ProcessName == "openvpn" or _Msg startswith "NOTICE [OpenVPN]"
+        // address is "<ipv4>", "<ipv4>:<port>" or an IPv6 address (no port split attempted)
+        | extend _Addr = tostring(_VpnSess[0][3])
+        | extend
+            EventType = iff(_SessState == "disconnected", "Logoff", "Logon"),
+            EventResult = iff(isnotempty(_VpnFail), "Failure", "Success"),
+            TargetUsername = coalesce(_VpnOk, _VpnFail, tostring(_VpnSess[0][2])),
+            SrcIpAddr = iff(_Addr has ".", tostring(split(_Addr, ":")[0]), _Addr),
+            SrcPortNumber = iff(_Addr has ".", toint(split(_Addr, ":")[1]), int(null)),
+            TargetAppId = tostring(_VpnSess[0][0])
+        | extend
+            EventResultDetails = iff(EventResult == "Failure", "No such user or password", ""),
+            EventOriginalResultDetails = iff(EventResult == "Failure", _Msg, ""),
+            LogonMethod = iff(_IsCert, "PKI", "Username & Password"),
+            TargetAppName = "OpenVPN",
+            LogonProtocol = "OpenVPN",
+            EventSubType = "Remote";
+    union Ssh, WebGui, OpenVpn
+    // ---------------------------------------------------------------- post-parse filters
+    | where array_length(username_has_any) == 0 or TargetUsername has_any (username_has_any)
+    | where array_length(targetappname_has_any) == 0 or TargetAppName has_any (targetappname_has_any)
+    | where array_length(srcipaddr_has_any_prefix) == 0 or has_any_ipv4_prefix(SrcIpAddr, srcipaddr_has_any_prefix)
+    | where array_length(eventtype_in) == 0 or EventType in~ (eventtype_in)
+    | where eventresult == '*' or EventResult =~ eventresult
+    | where array_length(eventresultdetails_in) == 0 or EventResultDetails in~ (eventresultdetails_in)
+    // ---------------------------------------------------------------- device (reporting firewall)
+    | extend _HostIsIp = isnotnull(parse_ipv4(HostName)) or isnotempty(parse_ipv6(HostName))
+    | extend
+        Dvc = HostName,
+        DvcHostname = iff(_HostIsIp, "", tostring(split(HostName, ".")[0])),
+        DvcFQDN = iff(_HostIsIp or HostName !contains ".", "", HostName),
+        DvcIpAddr = tostring(HostIP)
+    | extend
+        DvcDomain = iff(isnotempty(DvcFQDN), substring(DvcFQDN, strlen(DvcHostname) + 1), ""),
+        DvcDomainType = iff(isnotempty(DvcFQDN), "FQDN", "")
+    // the firewall is also the authentication target (SSH / WebGUI / OpenVPN server)
+    | extend
+        TargetHostname = DvcHostname,
+        TargetFQDN = DvcFQDN,
+        TargetDomain = DvcDomain,
+        TargetDomainType = DvcDomainType,
+        TargetIpAddr = DvcIpAddr
+    // ---------------------------------------------------------------- common ASIM fields
+    | extend
+        // TimeGenerated, not EventTime: the forwarded (RFC 3164) timestamp has no timezone, so
+        // Syslog.EventTime holds the device's local time labelled as UTC (observed: +120 min skew
+        // on CEST devices). TimeGenerated is the AMA ingestion time (seconds of delay).
+        EventStartTime = TimeGenerated,
+        EventEndTime = TimeGenerated,
+        EventVendor = "Netgate",
+        EventProduct = "pfSense",
+        EventSchema = "Authentication",
+        EventSchemaVersion = "1.0.0",
+        EventSeverity = iff(EventResult == "Failure", "Low", "Informational"),
+        EventOriginalSeverity = SeverityLevel,
+        EventOriginalType = ProcessName,
+        EventMessage = _Msg,
+        EventUid = _ItemId,
+        TargetUsernameType = iff(isnotempty(TargetUsername), "Simple", ""),
+        TargetAppType = "Service",
+        AdditionalFields = bag_pack("AuthSource", column_ifexists("_AuthSource", ""), "SshMethod", column_ifexists("SshMethod", ""))
+    // ---------------------------------------------------------------- aliases
+    | extend
+        User = TargetUsername,
+        Src = SrcIpAddr,
+        IpAddr = SrcIpAddr,
+        Dst = coalesce(TargetHostname, TargetIpAddr),
+        Application = TargetAppName,
+        LogonTarget = TargetAppName
+    | project-away _Ssh*, _Web*, _Vpn*, _Msg, _Repeat, _InvalidUser, _AuthSource, _SessState, _IsCert, _Addr, _HostIsIp, SshMethod, SyslogMessage, SourceSystem, MG, Computer, HostName, HostIP, EventTime, Facility, SeverityLevel, ProcessID, ProcessName
+};
+AuthenticationPfsense(starttime, endtime, username_has_any, targetappname_has_any, srcipaddr_has_any_prefix, srchostname_has_any, eventtype_in, eventresultdetails_in, eventresult, disabled)
+// -----------------------------------------------------------------------------------------
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Paste this file into Log Analytics / Microsoft Sentinel > Logs, replacing the last line with
+//        AuthenticationPfsense(ago(4h), now())
+//    to confirm it returns rows (requires the raw Syslog path with the "[pfsense]" marker).
+// 2. Restore the last line, "Save as Function", name it exactly vimAuthenticationPfsenseCustom,
+//    and keep the parameter list as-is (or deploy vimAuthenticationPfsenseCustom.json).
+// 3. Register it in the workspace-deployed Im_AuthenticationCustom "Custom" slot.

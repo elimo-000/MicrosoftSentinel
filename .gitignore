@@ -1,0 +1,5 @@
+# Git metadata
+.git/
+
+# Tools and all its contents
+tools/

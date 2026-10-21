@@ -1,0 +1,34 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "string",
+            "metadata": {
+                "description": "The Microsoft Sentinel workspace into which the function will be deployed. Has to be in the selected Resource Group."
+            }
+        }
+    },
+    "resources": [
+        {
+            "type": "Microsoft.OperationalInsights/workspaces/savedSearches",
+            "apiVersion": "2020-08-01",
+            "name": "[concat(parameters('workspace'), '/ASimAuthenticationPfsenseCustom')]",
+            "properties": {
+                "eTag": "*",
+                "displayName": "Netgate pfSense Authentication Parser (Custom, raw Syslog, parameterless)",
+                "category": "ASIM Custom Parsers",
+                "functionAlias": "ASimAuthenticationPfsenseCustom",
+                "functionParameters": "disabled:bool=false",
+                "version": 2,
+                "tags": [
+                    {
+                        "name": "description",
+                        "value": "Parameter-less wrapper around vimAuthenticationPfsenseCustom. Deploy vimAuthenticationPfsenseCustom first."
+                    }
+                ],
+                "query": "// =============================================================================================\n// ASIM Authentication Parser (parameter-less / \"ASim\") -- Netgate pfSense (Custom, raw Syslog)\n// =============================================================================================\n// Thin wrapper around vimAuthenticationPfsenseCustom, called with no-op filter values. This is\n// the standard ASIM parameterless-parser pattern: it exists so tools/queries that expect a\n// (near-)zero-argument view of the schema have something to call directly, and so it can be\n// registered for auto-discovery by _ASim_Authentication().\n//\n// DEPENDENCY: vimAuthenticationPfsenseCustom must already be saved as a function in this\n// workspace before saving this one -- deploy vimAuthenticationPfsenseCustom.kql first.\n//\n// Source table   : Syslog (raw pfSense path with the \"[pfsense]\" marker)\n// Schema         : ASIM Authentication, schema version 1.0.0\n//\n// DEPLOYMENT\n// -----------------------------------------------------------------------------------------\n// 1. Confirm vimAuthenticationPfsenseCustom is already saved as a function.\n// 2. Paste this file into Log Analytics / Microsoft Sentinel > Logs and run it to confirm\n//    it returns rows.\n// 3. \"Save as Function\", name it exactly ASimAuthenticationPfsenseCustom.\n// 4. Register this name in the workspace-deployed ASim_AuthenticationCustom \"Custom\" slot so\n//    _ASim_Authentication() picks it up automatically alongside the built-in sources.\n// =============================================================================================\nlet ASimAuthenticationPfsenseCustom = (disabled:bool=false) {\n    vimAuthenticationPfsenseCustom(\n        starttime = datetime(null),\n        endtime = datetime(null),\n        username_has_any = dynamic([]),\n        targetappname_has_any = dynamic([]),\n        srcipaddr_has_any_prefix = dynamic([]),\n        srchostname_has_any = dynamic([]),\n        eventtype_in = dynamic([]),\n        eventresultdetails_in = dynamic([]),\n        eventresult = '*',\n        disabled = disabled\n    )\n};\nASimAuthenticationPfsenseCustom(disabled)"
+            }
+        }
+    ]
+}

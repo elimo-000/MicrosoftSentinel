@@ -16,18 +16,18 @@
             "name": "[concat(parameters('workspace'), '/ASimNetworkSessionPfsenseCustom')]",
             "properties": {
                 "eTag": "*",
-                "displayName": "Network Session ASIM parser for pfSense (parameter-less)",
-                "category": "ASIM",
+                "displayName": "Netgate pfSense NetworkSession Parser (Custom, CEF, parameterless)",
+                "category": "ASIM Custom Parsers",
                 "functionAlias": "ASimNetworkSessionPfsenseCustom",
-                "functionParameters": "",
+                "functionParameters": "disabled:bool=false",
                 "version": 2,
                 "tags": [
                     {
                         "name": "description",
-                        "value": "Parameter-less companion to vimNetworkSessionPfsenseCustom, required alongside the filtering parser for the ASimNetworkSession unifying parser. Deploy vimNetworkSessionPfsenseCustom.json to the same workspace first."
+                        "value": "Parameter-less wrapper around vimNetworkSessionPfsenseCustom. Deploy vimNetworkSessionPfsenseCustom first."
                     }
                 ],
-                "query": "// New file. Microsoft's ASIM parser guidance is explicit that a custom source\n// needs BOTH pieces: \"Make sure to add both a filtering custom parser and a\n// parameter-less custom parser.\" You already deployed and wired up the\n// filtering one (vimNetworkSessionPfsenseCustom) into imNetworkSession -- this is\n// the parameter-less companion, needed if you also want pfSense picked up by\n// the non-parametrized ASimNetworkSession unifying parser.\n//\n// Deploy this as its own saved KQL function (separate from\n// vimNetworkSessionPfsenseCustom), named ASimNetworkSessionPfsense, and add the\n// equivalent reference line for it in your custom ASimNetworkSession\n// unifying parser, the same way you already did for vimNetworkSessionPfsenseCustom\n// in imNetworkSession.\nlet ASimNetworkSessionPfsense = () {\n    vimNetworkSessionPfsenseCustom(\n        starttime = datetime(null),\n        endtime = datetime(null),\n        srcipaddr_has_any_prefix = dynamic([]),\n        dstipaddr_has_any_prefix = dynamic([]),\n        ipaddr_has_any_prefix = dynamic([]),\n        dstportnumber = int(null),\n        hostname_has_any = dynamic([]),\n        dvcaction = dynamic([]),\n        eventresult = '*',\n        disabled = false\n    )\n};\nASimNetworkSessionPfsense()"
+                "query": "// =============================================================================================\n// ASIM NetworkSession Parser (parameter-less / \"ASim\") -- Netgate pfSense filterlog (Custom, CEF)\n// =============================================================================================\n// Thin wrapper around vimNetworkSessionPfsenseCustom, called with no-op filter values. This is\n// the standard ASIM parameterless-parser pattern: it exists so tools/queries that expect a\n// (near-)zero-argument view of the schema have something to call directly, and so it can be\n// registered for auto-discovery by _ASim_NetworkSession().\n//\n// LEGACY PATH (CommonSecurityLog / CEF): kept while devices migrate to the raw Syslog path\n// (ASimNetworkSessionPfsenseSyslogCustom). Never register both parsers for the same device.\n//\n// DEPENDENCY: vimNetworkSessionPfsenseCustom must already be saved as a function in this\n// workspace before saving this one -- deploy vimNetworkSessionPfsenseCustom.kql first.\n//\n// DEPLOYMENT\n// -----------------------------------------------------------------------------------------\n// 1. Confirm vimNetworkSessionPfsenseCustom is already saved as a function.\n// 2. Paste this file into Log Analytics / Microsoft Sentinel > Logs and run it to confirm\n//    it returns rows.\n// 3. \"Save as Function\", name it exactly ASimNetworkSessionPfsenseCustom.\n// 4. Register this name in the workspace-deployed ASim_NetworkSessionCustom \"Custom\" slot.\n// =============================================================================================\nlet ASimNetworkSessionPfsenseCustom = (disabled:bool=false) {\n    vimNetworkSessionPfsenseCustom(\n        starttime = datetime(null),\n        endtime = datetime(null),\n        srcipaddr_has_any_prefix = dynamic([]),\n        dstipaddr_has_any_prefix = dynamic([]),\n        ipaddr_has_any_prefix = dynamic([]),\n        dstportnumber = int(null),\n        hostname_has_any = dynamic([]),\n        dvcaction = dynamic([]),\n        eventresult = '*',\n        disabled = disabled\n    )\n};\nASimNetworkSessionPfsenseCustom(disabled)"
             }
         }
     ]

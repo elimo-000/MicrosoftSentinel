@@ -1,17 +1,27 @@
-// New file. Microsoft's ASIM parser guidance is explicit that a custom source
-// needs BOTH pieces: "Make sure to add both a filtering custom parser and a
-// parameter-less custom parser." You already deployed and wired up the
-// filtering one (vimNetworkSessionPfsense) into imNetworkSession -- this is
-// the parameter-less companion, needed if you also want pfSense picked up by
-// the non-parametrized ASimNetworkSession unifying parser.
+// =============================================================================================
+// ASIM NetworkSession Parser (parameter-less / "ASim") -- Netgate pfSense filterlog (Custom, CEF)
+// =============================================================================================
+// Thin wrapper around vimNetworkSessionPfsenseCustom, called with no-op filter values. This is
+// the standard ASIM parameterless-parser pattern: it exists so tools/queries that expect a
+// (near-)zero-argument view of the schema have something to call directly, and so it can be
+// registered for auto-discovery by _ASim_NetworkSession().
 //
-// Deploy this as its own saved KQL function (separate from
-// vimNetworkSessionPfsense), named ASimNetworkSessionPfsense, and add the
-// equivalent reference line for it in your custom ASimNetworkSession
-// unifying parser, the same way you already did for vimNetworkSessionPfsense
-// in imNetworkSession.
-let ASimNetworkSessionPfsense = () {
-    vimNetworkSessionPfsense(
+// LEGACY PATH (CommonSecurityLog / CEF): kept while devices migrate to the raw Syslog path
+// (ASimNetworkSessionPfsenseSyslogCustom). Never register both parsers for the same device.
+//
+// DEPENDENCY: vimNetworkSessionPfsenseCustom must already be saved as a function in this
+// workspace before saving this one -- deploy vimNetworkSessionPfsenseCustom.kql first.
+//
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Confirm vimNetworkSessionPfsenseCustom is already saved as a function.
+// 2. Paste this file into Log Analytics / Microsoft Sentinel > Logs and run it to confirm
+//    it returns rows.
+// 3. "Save as Function", name it exactly ASimNetworkSessionPfsenseCustom.
+// 4. Register this name in the workspace-deployed ASim_NetworkSessionCustom "Custom" slot.
+// =============================================================================================
+let ASimNetworkSessionPfsenseCustom = (disabled:bool=false) {
+    vimNetworkSessionPfsenseCustom(
         starttime = datetime(null),
         endtime = datetime(null),
         srcipaddr_has_any_prefix = dynamic([]),
@@ -21,7 +31,7 @@ let ASimNetworkSessionPfsense = () {
         hostname_has_any = dynamic([]),
         dvcaction = dynamic([]),
         eventresult = '*',
-        disabled = false
+        disabled = disabled
     )
 };
-ASimNetworkSessionPfsense()
+ASimNetworkSessionPfsenseCustom(disabled)

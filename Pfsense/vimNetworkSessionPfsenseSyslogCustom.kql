@@ -1,0 +1,270 @@
+// =============================================================================================
+// ASIM NetworkSession Parser (parameter-based / "vim") -- Netgate pfSense filterlog (Custom, raw Syslog)
+// =============================================================================================
+// Source table   : Syslog
+// Ingestion path : pfSense -> rsyslog collector dedicated port (PFsense_Rsyslog_Conf_Raw_Syslog.conf)
+//                  -> static "[pfsense]" marker -> Azure Monitor Agent -> Syslog
+// Schema         : ASIM NetworkSession, schema version 1.0.0 (verify against current docs at deploy
+//                  time -- https://learn.microsoft.com/azure/sentinel/normalization-schema-network)
+//
+// Replaces the CEF path (rsyslog field() reshaping into CommonSecurityLog, see CEF/ parsers):
+// the raw filterlog CSV is parsed here at query time, so a parsing fix also applies to data
+// that was already ingested, and nothing is lost in a collector-side transform.
+//
+// SOURCE SELECTION: ProcessName == "filterlog" and SyslogMessage startswith "[pfsense]" (the
+// static marker added by the dedicated-port rsyslog ruleset). Change PfsenseMarker below if
+// your template uses another marker.
+//
+// FILTERLOG CSV LAYOUT (Netgate "Raw Filter Log Format"), 0-based indexes after the marker:
+//   0 rule, 1 subrule, 2 anchor, 3 tracker, 4 interface, 5 reason, 6 action, 7 direction, 8 ipversion
+//   IPv4: 9 tos, 10 ecn, 11 ttl, 12 id, 13 offset, 14 flags, 15 protoid, 16 protoname, 17 length,
+//         18 src, 19 dst, protocol data from 20
+//   IPv6: 9 class, 10 flowlabel, 11 hoplimit, 12 protoname, 13 protoid, 14 length, 15 src, 16 dst,
+//         protocol data from 17
+//   TCP : srcport, dstport, datalength, tcpflags, seq, ack, window, urg, options
+//   UDP : srcport, dstport, datalength
+//   ICMP: icmptype, then type-specific fields (kept raw in AdditionalFields.IcmpData)
+//   CARP: type, ttl, vhid, version, advbase, advskew
+//
+// MAPPING NOTES
+// - NetworkDirection is derived from the address scopes (local/public), NOT from pf's
+//   per-interface in/out: "in" on a LAN interface is outbound traffic. Only when both ends are
+//   public (e.g. scans of the firewall's own WAN address) does pf's in/out decide. pf's raw
+//   direction is kept in AdditionalFields.PfDirection and drives DvcInbound/OutboundInterface.
+// - NetworkRuleName = pf tracker ID (stable across rule reordering); NetworkRuleNumber = rule
+//   ordinal. filterlog never carries the rule description.
+// - EventResultDetails is an enumeration in the schema -> "NA"; pf's reason (match, ...) goes to
+//   EventOriginalResultDetails.
+// - NetworkIcmpType = ICMP type name, NetworkIcmpCode = ICMP type number (per the schema doc's
+//   example "Destination Unreachable" <-> 3); the ICMP sub-code, when pf exposes one, is in
+//   AdditionalFields.IcmpSubCode.
+// - filterlog logs one packet per line: NetworkBytes = IP total length, NetworkPackets = 1.
+// - EventStartTime = TimeGenerated: the forwarded RFC 3164 timestamp has no timezone, so
+//   Syslog.EventTime holds device local time labelled as UTC.
+// =============================================================================================
+let PfsenseMarker = "[pfsense]";
+let LocalV4Ranges = dynamic(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+    "169.254.0.0/16", "127.0.0.0/8", "224.0.0.0/4", "255.255.255.255/32"]);
+let LocalV6Regex = @"(?i)^(f[cd]|fe[89ab]|ff|::1$)";
+// pf ICMP/ICMPv6 type text -> RFC 792 / RFC 4443 name, type number and (when implied) sub-code
+let IcmpLookup = datatable(_IpVer:string, _IcmpText:string, NetworkIcmpType:string, NetworkIcmpCode:int, _IcmpSubCode:int)[
+    "4", "request",      "Echo Request",            8,  int(null),
+    "4", "reply",        "Echo Reply",              0,  int(null),
+    "4", "unreach",      "Destination Unreachable", 3,  int(null),
+    "4", "unreachproto", "Destination Unreachable", 3,  2,
+    "4", "unreachport",  "Destination Unreachable", 3,  3,
+    "4", "needfrag",     "Destination Unreachable", 3,  4,
+    "4", "redirect",     "Redirect",                5,  int(null),
+    "4", "timexceed",    "Time Exceeded",           11, int(null),
+    "4", "paramprob",    "Parameter Problem",       12, int(null),
+    "4", "tstamp",       "Timestamp",               13, int(null),
+    "4", "tstampreply",  "Timestamp Reply",         14, int(null),
+    "4", "maskreq",      "Address Mask Request",    17, int(null),
+    "4", "maskreply",    "Address Mask Reply",      18, int(null),
+    "6", "request",      "Echo Request",            128, int(null),
+    "6", "reply",        "Echo Reply",              129, int(null),
+    "6", "unreach",      "Destination Unreachable", 1,  int(null),
+    "6", "unreachport",  "Destination Unreachable", 1,  4,
+    "6", "needfrag",     "Packet Too Big",          2,  int(null),
+    "6", "timexceed",    "Time Exceeded",           3,  int(null),
+    "6", "paramprob",    "Parameter Problem",       4,  int(null),
+    "6", "redirect",     "Redirect Message",        137, int(null)
+];
+let NetworkSessionPfsense = (
+    starttime:datetime = datetime(null),
+    endtime:datetime = datetime(null),
+    srcipaddr_has_any_prefix:dynamic = dynamic([]),
+    dstipaddr_has_any_prefix:dynamic = dynamic([]),
+    ipaddr_has_any_prefix:dynamic = dynamic([]),
+    dstportnumber:int = int(null),
+    hostname_has_any:dynamic = dynamic([]),
+    dvcaction:dynamic = dynamic([]),
+    eventresult:string = '*',
+    disabled:bool = false
+)
+{
+    let src_or_any = set_union(srcipaddr_has_any_prefix, ipaddr_has_any_prefix);
+    let dst_or_any = set_union(dstipaddr_has_any_prefix, ipaddr_has_any_prefix);
+    Syslog
+    | where not(disabled)
+    // pfSense filterlog carries no Src/Dst hostnames -> a hostname filter can never match
+    | where array_length(hostname_has_any) == 0
+    | where (isnull(starttime) or TimeGenerated >= starttime)
+        and (isnull(endtime) or TimeGenerated <= endtime)
+    | where ProcessName == "filterlog"
+    | where SyslogMessage startswith PfsenseMarker
+    // cheap pre-filters on the raw text before splitting (exact checks follow after parsing)
+    | where array_length(src_or_any) == 0 or has_any_ipv4_prefix(SyslogMessage, src_or_any)
+    | where array_length(dst_or_any) == 0 or has_any_ipv4_prefix(SyslogMessage, dst_or_any)
+    | where isnull(dstportnumber) or SyslogMessage has tostring(dstportnumber)
+    | extend _Msg = trim(@"\s+", substring(SyslogMessage, strlen(PfsenseMarker)))
+    // unwrap syslogd "message repeated N times: [ ... ]"
+    | extend _Repeat = toint(extract(@"^message repeated (\d+) times: \[", 1, _Msg))
+    | extend
+        EventCount = iff(isnotnull(_Repeat), _Repeat, int(1)),
+        _Msg = iff(isnotnull(_Repeat), trim(@"\s+", extract(@"^message repeated \d+ times: \[(.*?)\]?\s*$", 1, _Msg)), _Msg)
+    | extend _F = split(_Msg, ",")
+    | extend _IpVer = tostring(_F[8])
+    | where _IpVer in ("4", "6")
+    | extend
+        _V4 = _IpVer == "4",
+        _B = iff(_IpVer == "4", 20, 17)   // first protocol-specific field
+    | extend
+        NetworkRuleNumber = toint(_F[0]),
+        NetworkRuleName = tostring(_F[3]),
+        _Interface = tostring(_F[4]),
+        _Reason = tostring(_F[5]),
+        DvcOriginalAction = tostring(_F[6]),
+        _PfDirection = tostring(_F[7]),
+        _ProtoId = toint(iff(_V4, _F[15], _F[13])),
+        _ProtoName = tostring(iff(_V4, _F[16], _F[12])),
+        NetworkBytes = tolong(iff(_V4, _F[17], _F[14])),
+        SrcIpAddr = tostring(iff(_V4, _F[18], _F[15])),
+        DstIpAddr = tostring(iff(_V4, _F[19], _F[16])),
+        _Ttl = tostring(_F[11])   // IPv4 TTL / IPv6 hop limit (same index)
+    | extend
+        _IsTcpUdp = _ProtoId in (6, 17),
+        _IsIcmp = _ProtoId in (1, 58)
+    | extend
+        SrcPortNumber = iff(_IsTcpUdp, toint(_F[_B]), int(null)),
+        DstPortNumber = iff(_IsTcpUdp, toint(_F[_B + 1]), int(null)),
+        _PayloadBytes = iff(_IsTcpUdp, tolong(_F[_B + 2]), long(null)),
+        _TcpFlags = iff(_ProtoId == 6, tostring(_F[_B + 3]), ""),
+        _IcmpText = iff(_IsIcmp, tostring(_F[_B]), ""),
+        _IcmpData = iff(_IsIcmp, strcat_array(array_slice(_F, _B + 1, -1), ","), ""),
+        _CarpType = iff(_ProtoId == 112, tostring(_F[_B]), "")
+    // ---------------------------------------------------------------- exact post-parse filters
+    | where isnull(dstportnumber) or DstPortNumber == dstportnumber
+    | extend
+        _SrcMatch = array_length(src_or_any) > 0 and has_any_ipv4_prefix(SrcIpAddr, src_or_any),
+        _DstMatch = array_length(dst_or_any) > 0 and has_any_ipv4_prefix(DstIpAddr, dst_or_any)
+    | where (array_length(srcipaddr_has_any_prefix) == 0 or has_any_ipv4_prefix(SrcIpAddr, srcipaddr_has_any_prefix))
+        and (array_length(dstipaddr_has_any_prefix) == 0 or has_any_ipv4_prefix(DstIpAddr, dstipaddr_has_any_prefix))
+        and (array_length(ipaddr_has_any_prefix) == 0 or _SrcMatch or _DstMatch)
+    | extend ASimMatchingIpAddr = case(
+        array_length(ipaddr_has_any_prefix) == 0, "-",
+        _SrcMatch and _DstMatch, "Both",
+        _SrcMatch, "SrcIpAddr",
+        _DstMatch, "DstIpAddr",
+        "No match")
+    // ---------------------------------------------------------------- action / result
+    | extend DvcAction = case(
+        DvcOriginalAction == "pass", "Allow",
+        DvcOriginalAction in ("block", "reject"), "Deny",
+        DvcOriginalAction)
+    | where array_length(dvcaction) == 0 or DvcAction in~ (dvcaction)
+    | extend EventResult = iff(DvcAction == "Allow", "Success", "Failure")
+    | where eventresult == '*' or EventResult =~ eventresult
+    | extend
+        EventSeverity = iff(DvcAction == "Allow", "Informational", "Low"),
+        EventResultDetails = "NA",
+        EventOriginalResultDetails = _Reason
+    // ---------------------------------------------------------------- network fields
+    | extend
+        NetworkProtocol = toupper(_ProtoName),
+        NetworkProtocolVersion = iff(_V4, "IPv4", "IPv6"),
+        NetworkPackets = long(1),
+        DvcInboundInterface = iff(_PfDirection == "in", _Interface, ""),
+        DvcOutboundInterface = iff(_PfDirection == "out", _Interface, ""),
+        DvcInterface = _Interface
+    // Direction from address scopes: "local" = RFC 1918, CGNAT, link-local, loopback, multicast,
+    // broadcast (IPv4) / ULA, link-local, multicast, loopback (IPv6). When both ends are public
+    // (typically traffic to/from the firewall's own public WAN address) fall back to pf's direction.
+    | extend
+        _SrcLocal = iff(_V4, ipv4_is_in_any_range(SrcIpAddr, LocalV4Ranges), SrcIpAddr matches regex LocalV6Regex),
+        _DstLocal = iff(_V4, ipv4_is_in_any_range(DstIpAddr, LocalV4Ranges), DstIpAddr matches regex LocalV6Regex)
+    | extend NetworkDirection = case(
+        _SrcLocal and _DstLocal, "Local",
+        _SrcLocal, "Outbound",
+        _DstLocal, "Inbound",
+        _PfDirection == "in", "Inbound",
+        _PfDirection == "out", "Outbound",
+        "External")
+    | extend
+        TcpFlagsSyn = iff(_ProtoId == 6, _TcpFlags contains_cs "S", bool(null)),
+        TcpFlagsAck = iff(_ProtoId == 6, _TcpFlags contains_cs "A", bool(null)),
+        TcpFlagsFin = iff(_ProtoId == 6, _TcpFlags contains_cs "F", bool(null)),
+        TcpFlagsRst = iff(_ProtoId == 6, _TcpFlags contains_cs "R", bool(null)),
+        TcpFlagsPsh = iff(_ProtoId == 6, _TcpFlags contains_cs "P", bool(null)),
+        TcpFlagsUrg = iff(_ProtoId == 6, _TcpFlags contains_cs "U", bool(null)),
+        TcpFlagsEce = iff(_ProtoId == 6, _TcpFlags contains_cs "E", bool(null)),
+        TcpFlagsCwr = iff(_ProtoId == 6, _TcpFlags contains_cs "W", bool(null))
+    | lookup kind=leftouter IcmpLookup on _IpVer, _IcmpText
+    // ---------------------------------------------------------------- device (reporting firewall)
+    | extend _HostIsIp = isnotnull(parse_ipv4(HostName)) or isnotempty(parse_ipv6(HostName))
+    | extend
+        Dvc = HostName,
+        DvcHostname = iff(_HostIsIp, "", tostring(split(HostName, ".")[0])),
+        DvcFQDN = iff(_HostIsIp or HostName !contains ".", "", HostName),
+        DvcIpAddr = tostring(HostIP)
+    | extend
+        DvcDomain = iff(isnotempty(DvcFQDN), substring(DvcFQDN, strlen(DvcHostname) + 1), ""),
+        DvcDomainType = iff(isnotempty(DvcFQDN), "FQDN", "")
+    // ---------------------------------------------------------------- common ASIM fields
+    | extend
+        EventStartTime = TimeGenerated,
+        EventEndTime = TimeGenerated,
+        EventType = "NetworkSession",
+        EventVendor = "Netgate",
+        EventProduct = "pfSense",
+        EventSchema = "NetworkSession",
+        EventSchemaVersion = "1.0.0",
+        EventOriginalType = "filterlog",
+        EventOriginalSeverity = SeverityLevel,
+        EventUid = _ItemId,
+        AdditionalFields = bag_pack(
+            "PfDirection", _PfDirection,
+            "Reason", _Reason,
+            "TtlOrHopLimit", _Ttl,
+            "PayloadBytes", _PayloadBytes,
+            "TcpFlags", _TcpFlags,
+            "IcmpText", _IcmpText,
+            "IcmpSubCode", _IcmpSubCode,
+            "IcmpData", _IcmpData,
+            "CarpType", _CarpType)
+    // ---------------------------------------------------------------- aliases
+    | extend
+        Src = SrcIpAddr,
+        Dst = DstIpAddr,
+        IpAddr = SrcIpAddr,
+        Rule = coalesce(NetworkRuleName, tostring(NetworkRuleNumber)),
+        Dvc = coalesce(Dvc, DvcIpAddr)
+    | project-away _Msg, _Repeat, _F, _IpVer, _V4, _B, _Interface, _Reason, _PfDirection, _ProtoId, _ProtoName,
+        _Ttl, _IsTcpUdp, _IsIcmp, _PayloadBytes, _TcpFlags, _IcmpText, _IcmpData, _IcmpSubCode, _CarpType,
+        _SrcMatch, _DstMatch, _SrcLocal, _DstLocal, _HostIsIp,
+        SyslogMessage, SourceSystem, MG, Computer, HostName, HostIP, EventTime, Facility, SeverityLevel, ProcessID, ProcessName
+};
+NetworkSessionPfsense(starttime, endtime, srcipaddr_has_any_prefix, dstipaddr_has_any_prefix, ipaddr_has_any_prefix, dstportnumber, hostname_has_any, dvcaction, eventresult, disabled)
+// -----------------------------------------------------------------------------------------
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Paste this file into Log Analytics / Microsoft Sentinel > Logs, replacing the last line with
+//        NetworkSessionPfsense(ago(1h), now())
+//    to confirm it returns rows (requires the raw Syslog path with the "[pfsense]" marker).
+// 2. Restore the last line, "Save as Function", name it exactly
+//    vimNetworkSessionPfsenseSyslogCustom (or deploy vimNetworkSessionPfsenseSyslogCustom.json).
+// 3. Register it in the workspace-deployed Im_NetworkSessionCustom "Custom" slot -- only once the
+//    device(s) no longer also feed the CEF path, or sessions are counted twice.
+//
+// OFFLINE TEST (no ingestion needed): replace "Syslog" in the function body with the datatable
+// below (documentation IPs only) and run NetworkSessionPfsense().
+//
+// datatable(TimeGenerated:datetime, HostName:string, HostIP:string, ProcessName:string,
+//           SyslogMessage:string, SeverityLevel:string, Facility:string, EventTime:datetime,
+//           Computer:string, SourceSystem:string, MG:string, ProcessID:int, _ItemId:string)[
+//   datetime(2026-01-01), "fw01.example.com", "192.0.2.1", "filterlog",
+//   "[pfsense] 4,,,1000000103,vmx1,match,block,in,4,0x28,,230,54321,0,none,6,tcp,40,198.51.100.32,203.0.113.218,44141,10090,0,S,3310071898,,65535,,",
+//   "info", "local0", datetime(2026-01-01), "", "", "", 0, "1",
+//   datetime(2026-01-01), "fw01.example.com", "192.0.2.1", "filterlog",
+//   "[pfsense] 95,,,1000010965,vmx2,match,pass,in,4,0x0,,63,12345,0,DF,17,udp,76,192.0.2.10,203.0.113.53,51234,53,56",
+//   "info", "local0", datetime(2026-01-01), "", "", "", 0, "2",
+//   datetime(2026-01-01), "fw01.example.com", "192.0.2.1", "filterlog",
+//   "[pfsense] 5,,,1000000104,vmx1,match,pass,in,4,0x0,,64,4321,0,none,1,icmp,84,192.0.2.20,198.51.100.1,request,1234,1",
+//   "info", "local0", datetime(2026-01-01), "", "", "", 0, "3",
+//   datetime(2026-01-01), "fw01.example.com", "192.0.2.1", "filterlog",
+//   "[pfsense] 4,,,1000000103,vmx1,match,block,in,6,0x00,0x00000,57,tcp,6,40,2001:db8::10,2001:db8:1::20,44141,443,0,S,123456,,65535,,mss",
+//   "info", "local0", datetime(2026-01-01), "", "", "", 0, "4",
+//   datetime(2026-01-01), "fw01.example.com", "192.0.2.1", "filterlog",
+//   "[pfsense] message repeated 3 times: [ 4,,,1000000103,vmx1,match,block,in,4,0x28,,230,54321,0,none,6,tcp,40,198.51.100.32,203.0.113.218,44141,10090,0,S,3310071898,,65535,,]",
+//   "info", "local0", datetime(2026-01-01), "", "", "", 0, "5"
+// ]
