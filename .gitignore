@@ -3,3 +3,7 @@
 
 # Tools and all its contents
 tools/
+
+# Claude-related files
+.claude/
+CLAUDE.md
