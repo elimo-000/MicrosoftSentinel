@@ -1,0 +1,262 @@
+// =============================================================================================
+// ASIM NetworkSession Parser (parameter-based / "vim") -- Cloudflare Gateway (Custom, CCF connector)
+// =============================================================================================
+// Source table   : CloudflareV2_CL (Logpush datasets "gateway_network" and
+//                  "zero_trust_network_sessions")
+// Ingestion path : Cloudflare Logpush -> storage -> Cloudflare data connector, Codeless Connector
+//                  Framework (CCF) variant
+// Schema         : ASIM NetworkSession, schema version 1.0.0 (verify against current docs at deploy
+//                  time -- https://learn.microsoft.com/azure/sentinel/normalization-schema-network)
+//
+// WHY THIS PARSER EXISTS
+// -----------------------------------------------------------------------------------------
+// Microsoft ships no ASIM parser for Cloudflare. Cloudflare Gateway logs one connection in two
+// L4 datasets, and both are returned here as separate records of the same session:
+//   - gateway_network (EventSubType "Start"): the network-policy decision taken when the
+//     connection is opened -- allowed/blocked by which policy. No bytes, no duration.
+//   - zero_trust_network_sessions (EventSubType "End"): the session summary written when the
+//     connection closes -- duration, bytes each way, egress IP, close reason. No policy decision.
+// Both carry the same SessionID (NetworkSessionId), as do the HTTP-layer records in
+// vimWebSessionCloudflareGatewayCustom. Blocked connections have a Start record only.
+// Count connections with EventSubType == "Start"; sum bytes over EventSubType == "End".
+//
+// SOURCE SELECTION
+// -----------------------------------------------------------------------------------------
+// gateway_network: TransportProtocol set and HTTPMethod empty.
+// zero_trust_network_sessions: SessionStartTime set.
+// The table is read once and the two variants are mapped per field with iff()/case() (no union,
+// as the ASIM parser guidelines require). The output keeps only those datasets' columns
+// (project-keep), plus TimeGenerated, _ItemId, Type, TenantId and _ResourceId, so
+// ingestion_time() keeps working on the parser output.
+//
+// FIELD MAPPING NOTES
+// -----------------------------------------------------------------------------------------
+// - TimeGenerated is when the connector pulled the Logpush batch. EventStartTime/EventEndTime:
+//   Datetime (Start records), SessionStartTime/SessionEndTime (End records). End records are
+//   written when the session closes, so long sessions show up with an old EventStartTime.
+// - SrcIpAddr = SourceInternalIP (WARP virtual/CGNAT address, or the LAN address behind a
+//   GRE/IPsec on-ramp), falling back to SourceIP; the client's public IP (SourceIP) is in
+//   AdditionalFields.SourcePublicIP. SrcNatIpAddr/SrcNatPortNumber = EgressIP/EgressPort, the
+//   address Gateway used toward the destination (End records).
+// - SrcBytes = BytesSent (client -> origin), DstBytes = BytesReceived (origin -> client).
+// - DvcAction (Start): Action starting with "allow" -> Allow, "block" -> Deny. End records are
+//   sessions Gateway proxied -> Allow.
+// - EventResult/EventResultDetails (End) from ConnectionCloseReason, normalized to the schema's
+//   enumeration (raw value in EventOriginalResultDetails): CLIENT/ORIGIN_CLOSED -> Success
+//   "Terminated", CLIENT_IDLE_TIMEOUT -> Success "Timeout", unreachable/unroutable -> Failure
+//   "Routing issue", PROXY_CONN_REFUSED -> Failure "Reset", rate/port limits -> Failure
+//   "Transient error", other errors -> Failure "Unknown", UNKNOWN/empty (e.g. UDP) -> NA.
+//   Start records: Allow -> Success, Deny -> Failure, details "NA".
+// - DstFQDN/DstHostname/DstDomain from SNI (TLS server name), when present.
+// - SrcHostname/SrcDomain/SrcFQDN from DeviceName, which is sometimes a FQDN (e.g. "<host>.local");
+//   user-set names that are not valid host names (spaces, underscores, IPs) go to SrcDescription.
+//   hostname_has_any matches the device name (SrcHostname/SrcFQDN/SrcDescription) or DstFQDN/DstHostname.
+// - NetworkDirection: Offramp INTERNET -> Outbound, tunnels/mesh/WARP -> Local; for Start records
+//   (no Offramp) a private destination address -> Local, otherwise Outbound.
+// - SrcUserId is not set: the Cloudflare user UUID is not one of the ASIM UserIdType values; it is
+//   in AdditionalFields.UserID.
+// =============================================================================================
+let LocalV4Ranges = dynamic(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+    "169.254.0.0/16", "127.0.0.0/8"]);
+let LocalV6Regex = @"(?i)^(f[cd]|fe[89ab]|::1$)";
+let NetworkSessionCloudflareGateway=(
+  starttime:datetime=datetime(null), endtime:datetime=datetime(null)
+  , srcipaddr_has_any_prefix:dynamic=dynamic([])
+  , dstipaddr_has_any_prefix:dynamic=dynamic([])
+  , ipaddr_has_any_prefix:dynamic=dynamic([])
+  , dstportnumber:int=int(null)
+  , hostname_has_any:dynamic=dynamic([])
+  , dvcaction:dynamic=dynamic([])
+  , eventresult:string='*'
+  , disabled:bool=false
+  ){
+    let src_or_any=set_union(srcipaddr_has_any_prefix, ipaddr_has_any_prefix);
+    let dst_or_any=set_union(dstipaddr_has_any_prefix, ipaddr_has_any_prefix);
+    CloudflareV2_CL | where not(disabled)
+    // ******************************************************************
+    //  Pre-parsing filtering (physical columns only):
+      | where
+        (isnull(starttime) or TimeGenerated >= starttime)
+        and (isnull(endtime) or TimeGenerated <= endtime)
+        and ((isnotempty(TransportProtocol) and isempty(HTTPMethod)) or isnotnull(SessionStartTime))
+        and (array_length(srcipaddr_has_any_prefix) == 0 or has_any_ipv4_prefix(coalesce(SourceInternalIP, SourceIP), srcipaddr_has_any_prefix))
+        and (array_length(dstipaddr_has_any_prefix) == 0 or has_any_ipv4_prefix(coalesce(OriginIP, DestinationIP), dstipaddr_has_any_prefix))
+        and (array_length(ipaddr_has_any_prefix) == 0 or has_any_ipv4_prefix(coalesce(SourceInternalIP, SourceIP), ipaddr_has_any_prefix)
+            or has_any_ipv4_prefix(coalesce(OriginIP, DestinationIP), ipaddr_has_any_prefix))
+        and (isnull(dstportnumber) or DestinationPort == dstportnumber or OriginPort == dstportnumber)
+        and (array_length(hostname_has_any) == 0 or SNI has_any (hostname_has_any) or DeviceName has_any (hostname_has_any))
+    // *****************************************************************
+    | project-keep TimeGenerated, _ItemId, Type, TenantId, _ResourceId,
+        // gateway_network
+        AccountID, Action, ApplicationIDs, ApplicationNames, CategoryIDs, CategoryNames, Datetime,
+        DestinationIP, DestinationIPContinentCode, DestinationIPCountryCode, DestinationPort,
+        DetectedProtocol, DeviceID, DeviceName, Email, OverrideIP, OverridePort, PolicyID, PolicyName,
+        ProxyEndpoint, RegistrationID, SNI, SessionID, SourceIP, SourceIPContinentCode,
+        SourceIPCountryCode, SourceInternalIP, SourcePort, TransportProtocol, UserID, VirtualNetworkID,
+        VirtualNetworkName,
+        // zero_trust_network_sessions
+        BytesReceived, BytesSent, ClientTCPHandshakeDurationMs, ClientTLSCipher,
+        ClientTLSHandshakeDurationMs, ClientTLSVersion, ConnectionCloseReason, ConnectionReuse,
+        DestinationTunnelID, EgressColoName, EgressIP, EgressPort, EgressRuleID, EgressRuleName,
+        IngressColoName, Offramp, OriginIP, OriginPort, OriginTLSCertificateIssuer,
+        OriginTLSCertificateValidationResult, OriginTLSCipher, OriginTLSHandshakeDurationMs,
+        OriginTLSVersion, Protocol, RuleEvaluationDurationMs, SessionEndTime, SessionStartTime
+    | extend _IsEnd=isnotnull(SessionStartTime)
+    //
+    | extend
+    //
+    // ******************* Mandatory
+      EventCount=int(1),
+      EventStartTime=iff(_IsEnd, SessionStartTime, todatetime(Datetime)),
+      EventEndTime=iff(_IsEnd, coalesce(SessionEndTime, SessionStartTime), todatetime(Datetime)),
+      EventProduct="Gateway",
+      EventVendor="Cloudflare",
+      EventSchema="NetworkSession",
+      EventSchemaVersion="1.0.0",
+      Dvc="Gateway",
+      EventType="NetworkSession",
+      EventSubType=iff(_IsEnd, "End", "Start"),
+      DvcOriginalAction=Action,
+      DvcAction=case(
+          _IsEnd, "Allow",
+          Action startswith "allow", "Allow",
+          Action startswith "block", "Deny",
+          "")
+    | where array_length(dvcaction) == 0 or DvcAction in~ (dvcaction)
+    | extend EventOriginalResultDetails=ConnectionCloseReason
+    | extend EventResultDetails=case(
+          not(_IsEnd), "NA",
+          ConnectionCloseReason in ("CLIENT_CLOSED", "ORIGIN_CLOSED"), "Terminated",
+          ConnectionCloseReason == "CLIENT_IDLE_TIMEOUT", "Timeout",
+          ConnectionCloseReason in ("ORIGIN_UNREACHABLE", "ORIGIN_UNROUTABLE", "MISMATCHED_IP_VERSIONS"), "Routing issue",
+          ConnectionCloseReason == "PROXY_CONN_REFUSED", "Reset",
+          ConnectionCloseReason startswith "TOO_MANY_" or ConnectionCloseReason == "EGRESS_PORT_ALLOCATION_ERROR", "Transient error",
+          ConnectionCloseReason in ("", "UNKNOWN"), "NA",
+          "Unknown")
+    | extend EventResult=case(
+          not(_IsEnd) and DvcAction == "Allow", "Success",
+          not(_IsEnd) and DvcAction == "Deny", "Failure",
+          not(_IsEnd), "NA",
+          EventResultDetails in ("Terminated", "Timeout"), "Success",
+          EventResultDetails == "NA", "NA",
+          "Failure")
+    | where eventresult == '*' or EventResult =~ eventresult
+  // ********** Recommended
+  | extend
+      EventUid=_ItemId,
+      EventSeverity=iff(DvcAction == "Deny", "Low", "Informational"),
+      SrcIpAddr=coalesce(SourceInternalIP, SourceIP),
+      SrcPortNumber=SourcePort,
+      DstIpAddr=iff(_IsEnd, OriginIP, DestinationIP),
+      DstPortNumber=iff(_IsEnd, OriginPort, DestinationPort),
+      SrcBytes=iff(_IsEnd, tolong(BytesSent), long(null)),
+      DstBytes=iff(_IsEnd, tolong(BytesReceived), long(null)),
+      NetworkProtocol=case(
+          coalesce(TransportProtocol, Protocol) in~ ("udp", "quic"), "UDP",
+          coalesce(TransportProtocol, Protocol) =~ "icmpv6", "ICMPv6",
+          toupper(coalesce(TransportProtocol, Protocol)))
+  | extend
+      NetworkBytes=SrcBytes + DstBytes,
+      NetworkDuration=iff(_IsEnd, toint((EventEndTime - EventStartTime) / 1ms), int(null)),
+      NetworkProtocolVersion=case(DstIpAddr contains ":", "IPv6", isnotempty(DstIpAddr), "IPv4", "")
+  // DeviceName is user-set: a valid host name / FQDN goes to SrcHostname/SrcFQDN, anything else
+  // (spaces, underscores, an IP address, ...) to SrcDescription
+  | extend _DevIsHost=DeviceName matches regex @"^[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{1,63})*$" and isnull(parse_ipv4(DeviceName))
+  // ********** Optional
+  | extend
+      EventOriginalType=iff(_IsEnd, "zero_trust_network_sessions", "gateway_network"),
+      DvcScopeId=AccountID,
+      DvcZone=coalesce(VirtualNetworkName, VirtualNetworkID),
+      SrcGeoCountry=SourceIPCountryCode,
+      DstGeoCountry=DestinationIPCountryCode,
+      SrcHostname=iff(_DevIsHost, tostring(split(DeviceName, ".")[0]), ""),
+      SrcFQDN=iff(_DevIsHost and DeviceName contains ".", DeviceName, ""),
+      SrcDomain=iff(_DevIsHost and DeviceName contains ".", substring(DeviceName, indexof(DeviceName, ".") + 1), ""),
+      SrcDomainType=iff(_DevIsHost and DeviceName contains ".", "FQDN", ""),
+      SrcDescription=iff(_DevIsHost, "", DeviceName),
+      SrcDvcId=DeviceID,
+      SrcDvcIdType=iff(isnotempty(DeviceID), "Other", ""),
+      SrcUsername=Email,
+      SrcUsernameType=case(isempty(Email), "", Email contains "@", "UPN", "Simple"),
+      SrcNatIpAddr=EgressIP,
+      SrcNatPortNumber=iff(EgressPort > 0, EgressPort, int(null)),
+      DstNatIpAddr=OverrideIP,
+      DstNatPortNumber=iff(OverridePort > 0, OverridePort, int(null)),
+      DstFQDN=iff(SNI contains ".", SNI, ""),
+      DstHostname=tostring(split(SNI, ".")[0]),
+      DstDomain=iff(SNI contains ".", substring(SNI, indexof(SNI, ".") + 1), ""),
+      DstDomainType=iff(SNI contains ".", "FQDN", ""),
+      NetworkApplicationProtocol=toupper(DetectedProtocol),
+      NetworkSessionId=SessionID,
+      NetworkRuleName=PolicyName
+  | extend
+      _DstLocal=iff(DstIpAddr contains ":", DstIpAddr matches regex LocalV6Regex, ipv4_is_in_any_range(DstIpAddr, LocalV4Ranges))
+  | extend NetworkDirection=case(
+      Offramp == "INTERNET", "Outbound",
+      isnotempty(Offramp), "Local",
+      _DstLocal, "Local",
+      "Outbound")
+  // *************** post-parse filters (exact match on the normalized fields)
+  | extend
+      _SrcMatch=array_length(src_or_any) > 0 and has_any_ipv4_prefix(SrcIpAddr, src_or_any),
+      _DstMatch=array_length(dst_or_any) > 0 and has_any_ipv4_prefix(DstIpAddr, dst_or_any),
+      _SrcHostMatch=array_length(hostname_has_any) > 0 and DeviceName has_any (hostname_has_any),
+      _DstHostMatch=array_length(hostname_has_any) > 0 and (DstFQDN has_any (hostname_has_any) or DstHostname has_any (hostname_has_any))
+  | where (array_length(srcipaddr_has_any_prefix) == 0 or has_any_ipv4_prefix(SrcIpAddr, srcipaddr_has_any_prefix))
+      and (array_length(dstipaddr_has_any_prefix) == 0 or has_any_ipv4_prefix(DstIpAddr, dstipaddr_has_any_prefix))
+      and (array_length(ipaddr_has_any_prefix) == 0 or _SrcMatch or _DstMatch)
+      and (isnull(dstportnumber) or DstPortNumber == dstportnumber)
+      and (array_length(hostname_has_any) == 0 or _SrcHostMatch or _DstHostMatch)
+  | extend
+      ASimMatchingIpAddr=case(
+          array_length(ipaddr_has_any_prefix) == 0, "-",
+          _SrcMatch and _DstMatch, "Both",
+          _SrcMatch, "SrcIpAddr",
+          "DstIpAddr"),
+      ASimMatchingHostname=case(
+          array_length(hostname_has_any) == 0, "-",
+          _SrcHostMatch and _DstHostMatch, "Both",
+          _SrcHostMatch, "SrcHostname",
+          "DstHostname")
+  // *************** AdditionalFields: identity, TLS and routing detail that has no ASIM field
+  | extend AdditionalFields=bag_pack(
+        "SourcePublicIP", SourceIP,
+        "UserID", UserID,
+        "PolicyID", PolicyID,
+        "CategoryNames", CategoryNames,
+        "ApplicationNames", ApplicationNames,
+        "Offramp", Offramp,
+        "IngressColoName", IngressColoName,
+        "EgressColoName", EgressColoName,
+        "EgressRuleName", EgressRuleName,
+        "DestinationTunnelID", DestinationTunnelID,
+        "ClientTLSVersion", ClientTLSVersion,
+        "OriginTLSVersion", OriginTLSVersion,
+        "OriginTLSCertificateIssuer", OriginTLSCertificateIssuer,
+        "OriginTLSCertificateValidationResult", OriginTLSCertificateValidationResult
+    )
+  // **************Aliases
+  | extend
+      IpAddr=SrcIpAddr,
+      Src=SrcIpAddr,
+      Dst=DstIpAddr,
+      Hostname=DstHostname,
+      User=SrcUsername,
+      SessionId=NetworkSessionId,
+      Duration=NetworkDuration,
+      Rule=coalesce(NetworkRuleName, PolicyID)
+  | project-away _IsEnd, _DevIsHost, _DstLocal, _SrcMatch, _DstMatch, _SrcHostMatch, _DstHostMatch
+  };
+NetworkSessionCloudflareGateway(starttime, endtime, srcipaddr_has_any_prefix, dstipaddr_has_any_prefix, ipaddr_has_any_prefix, dstportnumber, hostname_has_any, dvcaction, eventresult, disabled)
+// -----------------------------------------------------------------------------------------
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Paste this entire file into Log Analytics / Microsoft Sentinel > Logs.
+// 2. Replace the last line with a test call, e.g.:
+//        NetworkSessionCloudflareGateway(ago(1h), now())
+//    to confirm it returns rows.
+// 3. Restore the last line, then use "Save as Function", name it exactly
+//    vimNetworkSessionCloudflareGatewayCustom, and keep the parameter list as-is
+//    (or deploy vimNetworkSessionCloudflareGatewayCustom.json).
+// 4. Register this name in the workspace-deployed Im_NetworkSessionCustom function's "Custom" slot
+//    so _Im_NetworkSession() and ASIM-based analytics/workbooks pick it up automatically.

@@ -23,7 +23,7 @@
 // ingestion metadata with no analytic value is dropped (Timestamp once typed into
 // EventStartTime/EventEndTime, Type, TenantId, _ResourceId).
 //
-// - MostGranularIdentity/Identities are real client hostnames (e.g. "LTGV21-2014", confirmed
+// - MostGranularIdentity/Identities are real client hostnames (e.g. "CLT-201", confirmed
 //   via sample data), not an abstract identity label -> mapped to SrcHostname (Recommended).
 // - IdentityTypes/MostGranularIdentityType (e.g. "Anyconnect Roaming Client") has no reliable
 //   mapping to ASIM's fixed SrcDeviceType enum (Computer/Mobile Device/IOT Device/Other)

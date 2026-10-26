@@ -1,0 +1,37 @@
+// =============================================================================================
+// ASIM WebSession Parser (parameter-less / "ASim") -- Cloudflare Gateway HTTP (Custom, CCF connector)
+// =============================================================================================
+// Thin wrapper around vimWebSessionCloudflareGatewayCustom, called with no-op filter values.
+// This is the standard ASIM parameterless-parser pattern: it exists so tools/queries that
+// expect a (near-)zero-argument view of the schema have something to call directly, and so it
+// can be registered for auto-discovery by _ASim_WebSession().
+//
+// DEPENDENCY: vimWebSessionCloudflareGatewayCustom must already be saved as a function in this
+// workspace before saving this one -- deploy vimWebSessionCloudflareGatewayCustom.kql first.
+//
+// Source table   : CloudflareV2_CL (Logpush dataset "gateway_http")
+// Schema         : ASIM WebSession, schema version 1.0.0
+//
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Confirm vimWebSessionCloudflareGatewayCustom is already saved as a function.
+// 2. Paste this file into Log Analytics / Microsoft Sentinel > Logs and run it to confirm
+//    it returns rows.
+// 3. "Save as Function", name it exactly ASimWebSessionCloudflareGatewayCustom.
+// 4. Register this name in the workspace-deployed ASim_WebSessionCustom "Custom" slot so
+//    _ASim_WebSession() picks it up automatically alongside the built-in sources.
+// =============================================================================================
+let ASimWebSessionCloudflareGatewayCustom = (disabled:bool=false) {
+    vimWebSessionCloudflareGatewayCustom(
+        starttime = datetime(null),
+        endtime = datetime(null),
+        srcipaddr_has_any_prefix = dynamic([]),
+        ipaddr_has_any_prefix = dynamic([]),
+        url_has_any = dynamic([]),
+        httpuseragent_has_any = dynamic([]),
+        eventresultdetails_in = dynamic([]),
+        eventresult = "*",
+        disabled = disabled
+    )
+};
+ASimWebSessionCloudflareGatewayCustom(disabled)

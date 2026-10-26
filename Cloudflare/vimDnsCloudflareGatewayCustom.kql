@@ -1,0 +1,211 @@
+// =============================================================================================
+// ASIM Dns Parser (parameter-based / "vim") -- Cloudflare Gateway DNS (Custom, CCF connector)
+// =============================================================================================
+// Source table   : CloudflareV2_CL (Logpush dataset "gateway_dns")
+// Ingestion path : Cloudflare Logpush -> storage -> Cloudflare data connector, Codeless Connector
+//                  Framework (CCF) variant
+// Schema         : ASIM Dns, schema version 1.0.0 (verify against current docs at deploy time --
+//                  https://learn.microsoft.com/azure/sentinel/normalization-schema-dns)
+//
+// WHY THIS PARSER EXISTS
+// -----------------------------------------------------------------------------------------
+// Microsoft ships no ASIM parser for Cloudflare. Gateway DNS is the resolver used by WARP clients
+// and Gateway locations; each record is one query with the resolver's policy decision.
+//
+// SOURCE SELECTION
+// -----------------------------------------------------------------------------------------
+// gateway_dns rows are the only ones with both QueryName and ResolverDecision.
+// The output keeps only the gateway_dns columns (project-keep), plus TimeGenerated, _ItemId,
+// Type, TenantId and _ResourceId, so ingestion_time() keeps working on the parser output.
+//
+// FIELD MAPPING NOTES
+// -----------------------------------------------------------------------------------------
+// - TimeGenerated is when the connector pulled the Logpush batch; EventStartTime = Datetime.
+// - EventResultDetails (DNS response code name) needs RCode, which the Logpush job may not send.
+//   The parser uses RCode, else InternalDNSRCode -- but only when the query went through an
+//   internal DNS view (InternalDNSViewID set): otherwise InternalDNSRCode is just 0 and would
+//   label every query NOERROR. Codes are named with an IANA case() table (no lookup operator:
+//   lookup drops the hidden ingestion time, so ingestion_time() would return null on the
+//   output). With no code, EventResultDetails = "NA"; EventResult is then Failure for blocked
+//   queries and NA otherwise. Add RCode, QueryType and ResourceRecordsJSON to the Logpush job
+//   to get full DNS analytics (NXDOMAIN, response IPs).
+// - DnsQuery is empty for queries of the DNS root (".").
+// - SrcHostname/SrcDomain/SrcFQDN from DeviceName, which is sometimes a FQDN (e.g. "<host>.local");
+//   user-set names that are not valid host names (spaces, underscores, IPs) go to SrcDescription.
+// - DnsResponseName = ResourceRecordsJSON (or RData / ResourceRecords) when sent; the
+//   response_has_ipv4 / response_has_any_prefix filters match on it and return nothing when it
+//   is empty, as the schema specifies.
+// - DvcAction from ResolverDecision: allowed* / override* -> Allow, blocked* -> Deny; raw value
+//   in DvcOriginalAction.
+// - UrlCategory = QueryCategoryNames (initial + CNAME + resolved-IP categories).
+//   ThreatCategory = MatchedIndicatorFeedNames (indicator feeds that matched).
+// - NetworkProtocol: Protocol "udp" -> UDP, anything else (tcp, https = DoH, tls = DoT) -> TCP.
+// - DstHostname = DstIpAddr: the schema makes DstHostname mandatory when DstIpAddr is set and
+//   asks for the IP when no name is known.
+// - SrcUserId is not set: the Cloudflare user UUID is not one of the ASIM UserIdType values; it is
+//   in AdditionalFields.UserID.
+// =============================================================================================
+let DnsCloudflareGateway=(
+  starttime:datetime=datetime(null), endtime:datetime=datetime(null)
+  , srcipaddr:string='*'
+  , domain_has_any:dynamic=dynamic([])
+  , responsecodename:string='*'
+  , response_has_ipv4:string='*' , response_has_any_prefix:dynamic=dynamic([])
+  , eventtype:string='Query'
+  , disabled:bool=false
+  ){
+    CloudflareV2_CL | where not(disabled)
+    // ******************************************************************
+    //  Pre-parsing filtering (physical columns only):
+      | where
+        (eventtype in~ ('lookup', 'Query'))
+        and (isnull(starttime) or TimeGenerated >= starttime)
+        and (isnull(endtime) or TimeGenerated <= endtime)
+        and isnotempty(QueryName) and isnotempty(ResolverDecision)
+        and (srcipaddr == '*' or SrcIP == srcipaddr)
+        and (array_length(domain_has_any) == 0 or QueryName has_any (domain_has_any))
+    // *****************************************************************
+    | project-keep TimeGenerated, _ItemId, Type, TenantId, _ResourceId,
+        AccountID, AuthoritativeNameServerIPs, CNAMECategoryIDs, CNAMECategoryNames, CNAMEs,
+        CNAMEsReversed, ColoID, ColoName, CustomResolveDurationMs, CustomResolverAddress,
+        CustomResolverPolicyID, CustomResolverPolicyName, CustomResolverResponse, Datetime, DeviceID,
+        DeviceName, DoHSubdomain, DoTSubdomain, DstIP, DstPort, EDEErrors, Email, InitialCategoryIDs,
+        InitialCategoryNames, InitialResolvedIPs, InternalDNSFallbackStrategy, InternalDNSRCode,
+        InternalDNSViewID, InternalDNSZoneID, IsResponseCached, Location, LocationID,
+        MatchedCategoryIDs, MatchedCategoryNames, MatchedIndicatorFeedIDs, MatchedIndicatorFeedNames,
+        PolicyID, PolicyName, Protocol, QueryCategoryIDs, QueryCategoryNames, QueryID,
+        QueryIndicatorFeedIDs, QueryIndicatorFeedNames, QueryName, QueryNameReversed, QuerySize,
+        QueryType, QueryTypeName, RCode, RData, RegistrationID, RequestContextCategoryIDs,
+        RequestContextCategoryNames, ResolvedIPCategoryIDs, ResolvedIPCategoryNames,
+        ResolvedIPContinentCodes, ResolvedIPCountryCodes, ResolverDecision, ResourceRecords,
+        ResourceRecordsJSON, SrcIP, SrcIPContinentCode, SrcIPCountryCode, SrcPort, TimeZone,
+        TimeZoneInferredMethod, UserID
+    | extend
+        DnsResponseCode=coalesce(RCode, iff(isnotempty(InternalDNSViewID), InternalDNSRCode, int(null))),
+        DnsResponseName=coalesce(ResourceRecordsJSON, RData, ResourceRecords)
+    | where (response_has_ipv4 == '*' or has_ipv4_prefix(DnsResponseName, response_has_ipv4))
+        and (array_length(response_has_any_prefix) == 0 or has_any_ipv4_prefix(DnsResponseName, response_has_any_prefix))
+    //
+    | extend
+    //
+    // ******************* Mandatory
+      EventCount=int(1),
+      EventStartTime=todatetime(Datetime),
+      EventEndTime=todatetime(Datetime),
+      EventProduct="Gateway",
+      EventVendor="Cloudflare",
+      EventSchema="Dns",
+      EventSchemaVersion="1.0.0",
+      Dvc="Gateway",
+      EventType="Query",
+      EventSubType="response",
+      DnsQuery=trim_end(@"\.", QueryName),
+      // IANA DNS RCODE names
+      EventResultDetails=case(
+          isnull(DnsResponseCode), "NA",
+          DnsResponseCode == 0, "NOERROR",
+          DnsResponseCode == 1, "FORMERR",
+          DnsResponseCode == 2, "SERVFAIL",
+          DnsResponseCode == 3, "NXDOMAIN",
+          DnsResponseCode == 4, "NOTIMP",
+          DnsResponseCode == 5, "REFUSED",
+          DnsResponseCode == 6, "YXDOMAIN",
+          DnsResponseCode == 7, "YXRRSET",
+          DnsResponseCode == 8, "NXRRSET",
+          DnsResponseCode == 9, "NOTAUTH",
+          DnsResponseCode == 10, "NOTZONE",
+          DnsResponseCode == 11, "DSOTYPENI",
+          DnsResponseCode == 16, "BADVERS",
+          DnsResponseCode == 17, "BADKEY",
+          DnsResponseCode == 18, "BADTIME",
+          DnsResponseCode == 19, "BADMODE",
+          DnsResponseCode == 20, "BADNAME",
+          DnsResponseCode == 21, "BADALG",
+          DnsResponseCode == 22, "BADTRUNC",
+          DnsResponseCode == 23, "BADCOOKIE",
+          strcat("RCODE", tostring(DnsResponseCode))),
+      DvcOriginalAction=ResolverDecision,
+      DvcAction=case(
+          ResolverDecision startswith "blocked", "Deny",
+          ResolverDecision startswith "allowed" or ResolverDecision startswith "override", "Allow",
+          "")
+    | where responsecodename == '*' or EventResultDetails =~ responsecodename
+    | extend EventResult=case(
+          DnsResponseCode == 0, "Success",
+          isnotnull(DnsResponseCode), "Failure",
+          DvcAction == "Deny", "Failure",
+          "NA")
+  // DeviceName is user-set: a valid host name / FQDN goes to SrcHostname/SrcFQDN, anything else
+  // (spaces, underscores, an IP address, ...) to SrcDescription
+  | extend _DevIsHost=DeviceName matches regex @"^[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{1,63})*$" and isnull(parse_ipv4(DeviceName))
+  // ********** Recommended
+  | extend
+      EventUid=_ItemId,
+      EventSeverity=iff(DvcAction == "Deny", "Low", "Informational"),
+      SrcIpAddr=SrcIP,
+      SrcHostname=iff(_DevIsHost, tostring(split(DeviceName, ".")[0]), ""),
+      SrcFQDN=iff(_DevIsHost and DeviceName contains ".", DeviceName, ""),
+      SrcDomain=iff(_DevIsHost and DeviceName contains ".", substring(DeviceName, indexof(DeviceName, ".") + 1), ""),
+      SrcDomainType=iff(_DevIsHost and DeviceName contains ".", "FQDN", ""),
+      SrcDescription=iff(_DevIsHost, "", DeviceName),
+      DnsQueryTypeName=QueryTypeName
+  // ********** Optional
+  | extend
+      EventOriginalUid=QueryID,
+      DvcScopeId=AccountID,
+      SrcPortNumber=SrcPort,
+      SrcGeoCountry=SrcIPCountryCode,
+      SrcDvcId=DeviceID,
+      SrcDvcIdType=iff(isnotempty(DeviceID), "Other", ""),
+      SrcUsername=Email,
+      SrcUsernameType=case(isempty(Email), "", Email contains "@", "UPN", "Simple"),
+      DstIpAddr=DstIP,
+      DstHostname=DstIP,
+      DstPortNumber=DstPort,
+      DnsQueryType=QueryType,
+      DnsSessionId=QueryID,
+      DnsResponseIpCountry=tostring(todynamic(ResolvedIPCountryCodes)[0]),
+      NetworkProtocol=iff(Protocol =~ "udp", "UDP", "TCP"),
+      NetworkProtocolVersion=case(SrcIP contains ":", "IPv6", isnotempty(SrcIP), "IPv4", ""),
+      RuleName=PolicyName,
+      UrlCategory=strcat_array(todynamic(QueryCategoryNames), ","),
+      ThreatCategory=strcat_array(todynamic(MatchedIndicatorFeedNames), ",")
+  // *************** AdditionalFields: policy and resolver detail that has no ASIM field
+  | extend AdditionalFields=bag_pack(
+        "UserID", UserID,
+        "PolicyID", PolicyID,
+        "Protocol", Protocol,
+        "Location", Location,
+        "MatchedCategoryNames", MatchedCategoryNames,
+        "CNAMEs", CNAMEs,
+        "IsResponseCached", IsResponseCached,
+        "CustomResolverAddress", CustomResolverAddress,
+        "CustomResolverResponse", CustomResolverResponse
+    )
+  // **************Aliases
+  | extend
+      DnsResponseCodeName=EventResultDetails,
+      DomainCategory=UrlCategory,
+      Domain=DnsQuery,
+      IpAddr=SrcIpAddr,
+      Src=SrcIpAddr,
+      Dst=DstIpAddr,
+      Hostname=SrcHostname,
+      User=SrcUsername,
+      SessionId=DnsSessionId,
+      Rule=coalesce(RuleName, PolicyID)
+  | project-away _DevIsHost
+  };
+DnsCloudflareGateway(starttime, endtime, srcipaddr, domain_has_any, responsecodename, response_has_ipv4, response_has_any_prefix, eventtype, disabled)
+// -----------------------------------------------------------------------------------------
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Paste this entire file into Log Analytics / Microsoft Sentinel > Logs.
+// 2. Replace the last line with a test call, e.g.:
+//        DnsCloudflareGateway(ago(1h), now())
+//    to confirm it returns rows.
+// 3. Restore the last line, then use "Save as Function", name it exactly
+//    vimDnsCloudflareGatewayCustom, and keep the parameter list as-is
+//    (or deploy vimDnsCloudflareGatewayCustom.json).
+// 4. Register this name in the workspace-deployed Im_DnsCustom function's "Custom" slot
+//    so _Im_Dns() and ASIM-based analytics/workbooks pick it up automatically.

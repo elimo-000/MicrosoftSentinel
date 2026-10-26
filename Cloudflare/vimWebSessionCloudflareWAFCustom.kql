@@ -1,0 +1,223 @@
+// =============================================================================================
+// ASIM WebSession Parser (parameter-based / "vim") -- Cloudflare WAF / CDN (Custom, CCF connector)
+// =============================================================================================
+// Source table   : CloudflareV2_CL (Logpush dataset "http_requests")
+// Ingestion path : Cloudflare Logpush -> storage -> Cloudflare data connector, Codeless Connector
+//                  Framework (CCF) variant
+// Schema         : ASIM WebSession, schema version 1.0.0 (verify against current docs at deploy time --
+//                  https://learn.microsoft.com/azure/sentinel/normalization-schema-web)
+//
+// WHY THIS PARSER EXISTS
+// -----------------------------------------------------------------------------------------
+// Microsoft ships no ASIM parser for Cloudflare. The CCF connector writes every Logpush dataset
+// (http_requests, firewall_events, gateway_*, zero_trust_network_sessions, ...) into the single
+// CloudflareV2_CL table, which has ~500 columns and no column naming the dataset.
+//
+// SOURCE SELECTION
+// -----------------------------------------------------------------------------------------
+// http_requests rows are the only ones with EdgeStartTimestamp. One row per inbound request
+// (allowed or mitigated). firewall_events is NOT read: it has one row per WAF rule match with the
+// same RayID, so it would double-count requests; the terminating rule is already in
+// SecurityRuleID/SecurityRuleDescription here.
+// The output keeps only the http_requests columns (project-keep), plus TimeGenerated, _ItemId,
+// Type, TenantId and _ResourceId, so ingestion_time() keeps working on the parser output.
+//
+// FIELD MAPPING NOTES
+// -----------------------------------------------------------------------------------------
+// - TimeGenerated is when the connector pulled the Logpush batch (minutes after the request).
+//   EventStartTime/EventEndTime = EdgeStartTimestamp/EdgeEndTimestamp (real request time).
+// - EventType = HTTPsession: Cloudflare is an intermediary (reverse proxy) between client and origin.
+//   Url = ClientRequestScheme://ClientRequestHost + ClientRequestURI (path + query string).
+// - DstIpAddr = OriginIP (only if sent by the Logpush job); DstFQDN/DstHostname/DstDomain = the
+//   requested virtual host (ClientRequestHost, port stripped), so Dst is never empty.
+// - DvcAction from SecurityAction (the terminating security action): block, unsolved challenges,
+//   connection close and interstitial pages -> Deny; everything else (no action, log, skip,
+//   bypass, rewrite, *Solved, *Bypassed, linkMazeInjected) -> Allow. Raw value in DvcOriginalAction.
+// - EventResult from EdgeResponseStatus (status returned to the client): < 400 Success, >= 400
+//   Failure, 0 NA.
+// - WAFAttackScore: 1 = almost certainly an attack, 99 = clean, 100 = not scored, 0 = never reached
+//   scoring. ThreatRiskLevel = 100 - score for 1..99 only; the raw score is in ThreatOriginalRiskLevel.
+//   Requests that were NOT denied but scored as "attack" (1-20) get EventSeverity Medium.
+// - Fields that Cloudflare documents but the Logpush job may not send (OriginIP, OriginResponseStatus,
+//   OriginResponseDurationMs, EdgeResponseContentType, ClientCity, BotScore, JA3/JA4, ...) are mapped
+//   anyway; they stay empty until the field is added to the Logpush job.
+// - Cookies and RequestHeaders are kept as raw columns but NOT mapped to HttpCookie (sensitive).
+// =============================================================================================
+let WebSessionCloudflareWAF=(
+  starttime:datetime=datetime(null), endtime:datetime=datetime(null)
+  , srcipaddr_has_any_prefix:dynamic=dynamic([])
+  , ipaddr_has_any_prefix:dynamic=dynamic([])
+  , url_has_any:dynamic=dynamic([])
+  , httpuseragent_has_any:dynamic=dynamic([])
+  , eventresultdetails_in:dynamic=dynamic([])
+  , eventresult:string='*'
+  , disabled:bool=false
+  ){
+    CloudflareV2_CL | where not(disabled)
+    // ******************************************************************
+    //  Pre-parsing filtering (physical columns only):
+      | where
+        (isnull(starttime) or TimeGenerated >= starttime)
+        and (isnull(endtime) or TimeGenerated <= endtime)
+        and isnotempty(EdgeStartTimestamp)
+        and (array_length(srcipaddr_has_any_prefix) == 0 or has_any_ipv4_prefix(ClientIP, srcipaddr_has_any_prefix))
+        and (array_length(ipaddr_has_any_prefix) == 0 or has_any_ipv4_prefix(ClientIP, ipaddr_has_any_prefix) or has_any_ipv4_prefix(OriginIP, ipaddr_has_any_prefix))
+        and (array_length(httpuseragent_has_any) == 0 or ClientRequestUserAgent has_any (httpuseragent_has_any))
+        and (array_length(eventresultdetails_in) == 0 or tostring(EdgeResponseStatus) in (eventresultdetails_in))
+    // *****************************************************************
+    | project-keep TimeGenerated, _ItemId, Type, TenantId, _ResourceId,
+        BotDetectionIDs, BotDetectionTags, BotScore, BotScoreSrc, BotTags,
+        CacheCacheStatus, CacheReserveUsed, CacheResponseBytes, CacheResponseStatus, CacheTieredFill,
+        ClientASN, ClientCity, ClientCountry, ClientDeviceType, ClientIP, ClientIPClass, ClientLatitude,
+        ClientLongitude, ClientMTLSAuthCertFingerprint, ClientMTLSAuthStatus, ClientRegionCode,
+        ClientRequestBytes, ClientRequestHost, ClientRequestMethod, ClientRequestPath, ClientRequestProtocol,
+        ClientRequestReferer, ClientRequestScheme, ClientRequestSource, ClientRequestURI,
+        ClientRequestUserAgent, ClientSSLCipher, ClientSSLProtocol, ClientSrcPort, ClientTCPRTTMs,
+        ClientXRequestedWith, ContentScanObjResults, ContentScanObjSizes, ContentScanObjTypes, Cookies,
+        EdgeCFConnectingO2O, EdgeColoCode, EdgeColoID, EdgeEndTimestamp, EdgePathingOp, EdgePathingSrc,
+        EdgePathingStatus, EdgeRequestHost, EdgeResponseBodyBytes, EdgeResponseBytes,
+        EdgeResponseCompressionRatio, EdgeResponseContentType, EdgeResponseStatus, EdgeServerIP,
+        EdgeStartTimestamp, EdgeTimeToFirstByteMs, JA3Hash, JA4, JA4Signals, LeakedCredentialCheckResult,
+        OriginDNSResponseTimeMs, OriginIP, OriginRequestHeaderSendDurationMs, OriginResponseBytes,
+        OriginResponseDurationMs, OriginResponseHTTPExpires, OriginResponseHTTPLastModified,
+        OriginResponseHeaderReceiveDurationMs, OriginResponseStatus, OriginSSLProtocol,
+        OriginTCPHandshakeDurationMs, ParentRayID, RayID, RequestHeaders, ResponseHeaders,
+        SecurityAction, SecurityActions, SecurityRuleDescription, SecurityRuleID, SecurityRuleIDs,
+        SecuritySources, SmartRouteColoID, UpperTierColoID, WAFAttackScore, WAFRCEAttackScore,
+        WAFSQLiAttackScore, WAFXSSAttackScore, WorkerCPUTime, WorkerScriptName, WorkerStatus,
+        WorkerSubrequest, WorkerSubrequestCount, WorkerWallTimeUs, ZoneName
+    | extend Url=strcat(ClientRequestScheme, "://", ClientRequestHost, ClientRequestURI)
+    | where array_length(url_has_any) == 0 or Url has_any (url_has_any)
+    //
+    | extend
+    //
+    // ******************* Mandatory
+      EventCount=int(1),
+      EventStartTime=todatetime(EdgeStartTimestamp),
+      EventEndTime=coalesce(todatetime(EdgeEndTimestamp), todatetime(EdgeStartTimestamp)),
+      EventProduct="WAF",
+      EventVendor="Cloudflare",
+      EventSchema="WebSession",
+      EventSchemaVersion="1.0.0",
+      Dvc="WAF",
+      EventType="HTTPsession",
+      EventResult=case(
+          EdgeResponseStatus == 0 or isnull(EdgeResponseStatus), "NA",
+          EdgeResponseStatus < 400, "Success",
+          "Failure")
+    | where eventresult == '*' or EventResult =~ eventresult
+  // ********** Recommended
+  | extend
+      EventResultDetails=iff(EdgeResponseStatus > 0, tostring(EdgeResponseStatus), "NA"),
+      EventUid=_ItemId,
+      SrcIpAddr=ClientIP,
+      DvcIpAddr=EdgeServerIP,
+      DvcOriginalAction=SecurityAction,
+      DvcAction=iff(SecurityAction in~ ("block", "challenge", "jschallenge", "managedChallenge",
+          "connectionClose", "forceConnectionClose", "precursorInterstitialPageIssued"), "Deny", "Allow"),
+      HttpRequestMethod=ClientRequestMethod
+  | extend EventSeverity=case(
+      DvcAction == "Deny", "Low",
+      WAFAttackScore between (1 .. 20), "Medium",
+      "Informational")
+  // ********** Optional
+  | extend
+      EventOriginalUid=RayID,
+      EventOriginalResultDetails=iff(OriginResponseStatus > 0, tostring(OriginResponseStatus), ""),
+      DvcScope=ZoneName,
+      SrcPortNumber=ClientSrcPort,
+      SrcGeoCountry=toupper(ClientCountry),
+      SrcGeoRegion=ClientRegionCode,
+      SrcGeoCity=ClientCity,
+      SrcGeoLatitude=toreal(ClientLatitude),
+      SrcGeoLongitude=toreal(ClientLongitude),
+      SrcDeviceType=case(
+          ClientDeviceType =~ "desktop", "Computer",
+          ClientDeviceType in~ ("mobile", "tablet"), "Mobile Device",
+          ""),
+      DstIpAddr=OriginIP,
+      _Host=iff(ClientRequestHost startswith "[", "", tostring(split(ClientRequestHost, ":")[0])),
+      HttpHost=ClientRequestHost,
+      HttpVersion=case(
+          ClientRequestProtocol == "HTTP/1.0", "1.0",
+          ClientRequestProtocol == "HTTP/1.1", "1.1",
+          ClientRequestProtocol == "HTTP/2", "2.0",
+          ClientRequestProtocol == "HTTP/3", "3.0",
+          ""),
+      HttpUserAgent=ClientRequestUserAgent,
+      HttpReferrer=ClientRequestReferer,
+      HttpContentType=EdgeResponseContentType,
+      HttpContentFormat=trim(@"\s+", tostring(split(EdgeResponseContentType, ";")[0])),
+      HttpResponseTime=OriginResponseDurationMs,
+      HttpResponseBodyBytes=tolong(EdgeResponseBodyBytes),
+      SrcBytes=tolong(ClientRequestBytes),
+      DstBytes=tolong(EdgeResponseBytes),
+      NetworkProtocol=iff(ClientRequestProtocol == "HTTP/3", "UDP", "TCP"),
+      NetworkApplicationProtocol=toupper(ClientRequestScheme),
+      NetworkDirection="Inbound",
+      RuleName=SecurityRuleDescription,
+      ThreatRiskLevel=iff(WAFAttackScore between (1 .. 99), toint(100 - WAFAttackScore), int(null)),
+      ThreatOriginalRiskLevel=iff(isnotnull(WAFAttackScore), tostring(WAFAttackScore), "")
+  // destination = the requested virtual host (Host header, port stripped); empty when it is an IP
+  | extend _HostIsName=isnotempty(_Host) and isnull(parse_ipv4(_Host))
+  | extend
+      NetworkBytes=SrcBytes + DstBytes,
+      DstFQDN=iff(_HostIsName and _Host contains ".", _Host, ""),
+      DstHostname=iff(_HostIsName, tostring(split(_Host, ".")[0]), ""),
+      DstDomain=iff(_HostIsName and _Host contains ".", substring(_Host, indexof(_Host, ".") + 1), ""),
+      DstDomainType=iff(_HostIsName and _Host contains ".", "FQDN", "")
+  // *************** AdditionalFields: security detail that has no ASIM field
+  | extend AdditionalFields=bag_pack(
+        "SecurityRuleID", SecurityRuleID,
+        "SecuritySources", SecuritySources,
+        "SecurityActions", SecurityActions,
+        "WAFAttackScoreClass", case(
+            WAFAttackScore between (1 .. 20), "attack",
+            WAFAttackScore between (21 .. 50), "likely_attack",
+            WAFAttackScore between (51 .. 80), "likely_clean",
+            WAFAttackScore between (81 .. 99), "clean",
+            WAFAttackScore == 100, "unscored",
+            ""),
+        "WAFSQLiAttackScore", WAFSQLiAttackScore,
+        "WAFXSSAttackScore", WAFXSSAttackScore,
+        "WAFRCEAttackScore", WAFRCEAttackScore,
+        "BotScore", BotScore,
+        "JA3Hash", JA3Hash,
+        "JA4", JA4,
+        "ClientASN", ClientASN,
+        "ClientIPClass", ClientIPClass,
+        "ClientRequestSource", ClientRequestSource,
+        "CacheCacheStatus", CacheCacheStatus,
+        "ClientSSLProtocol", ClientSSLProtocol
+    )
+  // **************Aliases
+  | extend
+      IpAddr=SrcIpAddr,
+      Src=SrcIpAddr,
+      Dst=coalesce(DstIpAddr, DstFQDN, ClientRequestHost),
+      Hostname=DstHostname,
+      HttpStatusCode=EventResultDetails,
+      UserAgent=HttpUserAgent,
+      Rule=coalesce(RuleName, SecurityRuleID)
+  | extend
+      ASimMatchingIpAddr=case(
+          array_length(ipaddr_has_any_prefix) == 0, "-",
+          has_any_ipv4_prefix(SrcIpAddr, ipaddr_has_any_prefix) and has_any_ipv4_prefix(DstIpAddr, ipaddr_has_any_prefix), "Both",
+          has_any_ipv4_prefix(SrcIpAddr, ipaddr_has_any_prefix), "SrcIpAddr",
+          "DstIpAddr"),
+      ASimMatchingHostname="-"   // WebSession has no hostname filter parameter
+  | project-away _Host, _HostIsName
+  };
+WebSessionCloudflareWAF(starttime, endtime, srcipaddr_has_any_prefix, ipaddr_has_any_prefix, url_has_any, httpuseragent_has_any, eventresultdetails_in, eventresult, disabled)
+// -----------------------------------------------------------------------------------------
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Paste this entire file into Log Analytics / Microsoft Sentinel > Logs.
+// 2. Replace the last line with a test call, e.g.:
+//        WebSessionCloudflareWAF(ago(1h), now())
+//    to confirm it returns rows.
+// 3. Restore the last line, then use "Save as Function", name it exactly
+//    vimWebSessionCloudflareWAFCustom, and keep the parameter list as-is
+//    (or deploy vimWebSessionCloudflareWAFCustom.json).
+// 4. Register this name in the workspace-deployed Im_WebSessionCustom function's "Custom" slot
+//    so _Im_WebSession() and ASIM-based analytics/workbooks pick it up automatically.

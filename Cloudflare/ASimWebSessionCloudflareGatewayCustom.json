@@ -1,0 +1,34 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "string",
+            "metadata": {
+                "description": "The Microsoft Sentinel workspace into which the function will be deployed. Has to be in the selected Resource Group."
+            }
+        }
+    },
+    "resources": [
+        {
+            "type": "Microsoft.OperationalInsights/workspaces/savedSearches",
+            "apiVersion": "2020-08-01",
+            "name": "[concat(parameters('workspace'), '/ASimWebSessionCloudflareGatewayCustom')]",
+            "properties": {
+                "eTag": "*",
+                "displayName": "Cloudflare Gateway WebSession Parser (Custom, CCF, parameterless)",
+                "category": "ASIM Custom Parsers",
+                "functionAlias": "ASimWebSessionCloudflareGatewayCustom",
+                "functionParameters": "disabled:bool=false",
+                "version": 2,
+                "tags": [
+                    {
+                        "name": "description",
+                        "value": "Parameter-less wrapper around vimWebSessionCloudflareGatewayCustom."
+                    }
+                ],
+                "query": "// =============================================================================================\n// ASIM WebSession Parser (parameter-less / \"ASim\") -- Cloudflare Gateway HTTP (Custom, CCF connector)\n// =============================================================================================\n// Thin wrapper around vimWebSessionCloudflareGatewayCustom, called with no-op filter values.\n// This is the standard ASIM parameterless-parser pattern: it exists so tools/queries that\n// expect a (near-)zero-argument view of the schema have something to call directly, and so it\n// can be registered for auto-discovery by _ASim_WebSession().\n//\n// DEPENDENCY: vimWebSessionCloudflareGatewayCustom must already be saved as a function in this\n// workspace before saving this one -- deploy vimWebSessionCloudflareGatewayCustom.kql first.\n//\n// Source table   : CloudflareV2_CL (Logpush dataset \"gateway_http\")\n// Schema         : ASIM WebSession, schema version 1.0.0\n//\n// DEPLOYMENT\n// -----------------------------------------------------------------------------------------\n// 1. Confirm vimWebSessionCloudflareGatewayCustom is already saved as a function.\n// 2. Paste this file into Log Analytics / Microsoft Sentinel > Logs and run it to confirm\n//    it returns rows.\n// 3. \"Save as Function\", name it exactly ASimWebSessionCloudflareGatewayCustom.\n// 4. Register this name in the workspace-deployed ASim_WebSessionCustom \"Custom\" slot so\n//    _ASim_WebSession() picks it up automatically alongside the built-in sources.\n// =============================================================================================\nlet ASimWebSessionCloudflareGatewayCustom = (disabled:bool=false) {\n    vimWebSessionCloudflareGatewayCustom(\n        starttime = datetime(null),\n        endtime = datetime(null),\n        srcipaddr_has_any_prefix = dynamic([]),\n        ipaddr_has_any_prefix = dynamic([]),\n        url_has_any = dynamic([]),\n        httpuseragent_has_any = dynamic([]),\n        eventresultdetails_in = dynamic([]),\n        eventresult = \"*\",\n        disabled = disabled\n    )\n};\nASimWebSessionCloudflareGatewayCustom(disabled)"
+            }
+        }
+    ]
+}

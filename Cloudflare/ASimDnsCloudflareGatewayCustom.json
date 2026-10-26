@@ -1,0 +1,34 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "string",
+            "metadata": {
+                "description": "The Microsoft Sentinel workspace into which the function will be deployed. Has to be in the selected Resource Group."
+            }
+        }
+    },
+    "resources": [
+        {
+            "type": "Microsoft.OperationalInsights/workspaces/savedSearches",
+            "apiVersion": "2020-08-01",
+            "name": "[concat(parameters('workspace'), '/ASimDnsCloudflareGatewayCustom')]",
+            "properties": {
+                "eTag": "*",
+                "displayName": "Cloudflare Gateway DNS Parser (Custom, CCF, parameterless)",
+                "category": "ASIM Custom Parsers",
+                "functionAlias": "ASimDnsCloudflareGatewayCustom",
+                "functionParameters": "disabled:bool=false",
+                "version": 2,
+                "tags": [
+                    {
+                        "name": "description",
+                        "value": "Parameter-less wrapper around vimDnsCloudflareGatewayCustom."
+                    }
+                ],
+                "query": "// =============================================================================================\n// ASIM Dns Parser (parameter-less / \"ASim\") -- Cloudflare Gateway DNS (Custom, CCF connector)\n// =============================================================================================\n// Thin wrapper around vimDnsCloudflareGatewayCustom, called with no-op filter values. This is\n// the standard ASIM parameterless-parser pattern: it exists so tools/queries that expect a\n// (near-)zero-argument view of the schema have something to call directly, and so it can be\n// registered for auto-discovery by _ASim_Dns().\n//\n// DEPENDENCY: vimDnsCloudflareGatewayCustom must already be saved as a function in this\n// workspace before saving this one -- deploy vimDnsCloudflareGatewayCustom.kql first.\n//\n// Source table   : CloudflareV2_CL (Logpush dataset \"gateway_dns\")\n// Schema         : ASIM Dns, schema version 1.0.0\n//\n// DEPLOYMENT\n// -----------------------------------------------------------------------------------------\n// 1. Confirm vimDnsCloudflareGatewayCustom is already saved as a function.\n// 2. Paste this file into Log Analytics / Microsoft Sentinel > Logs and run it to confirm\n//    it returns rows.\n// 3. \"Save as Function\", name it exactly ASimDnsCloudflareGatewayCustom.\n// 4. Register this name in the workspace-deployed ASim_DnsCustom \"Custom\" slot so\n//    _ASim_Dns() picks it up automatically alongside the built-in sources.\n// =============================================================================================\nlet ASimDnsCloudflareGatewayCustom = (disabled:bool=false) {\n    vimDnsCloudflareGatewayCustom(\n        starttime = datetime(null),\n        endtime = datetime(null),\n        srcipaddr = '*',\n        domain_has_any = dynamic([]),\n        responsecodename = '*',\n        response_has_ipv4 = '*',\n        response_has_any_prefix = dynamic([]),\n        eventtype = 'Query',\n        disabled = disabled\n    )\n};\nASimDnsCloudflareGatewayCustom(disabled)"
+            }
+        }
+    ]
+}

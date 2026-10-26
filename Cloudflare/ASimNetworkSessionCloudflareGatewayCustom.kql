@@ -1,0 +1,40 @@
+// =============================================================================================
+// ASIM NetworkSession Parser (parameter-less / "ASim") -- Cloudflare Gateway (Custom, CCF connector)
+// =============================================================================================
+// Thin wrapper around vimNetworkSessionCloudflareGatewayCustom, called with no-op filter
+// values. This is the standard ASIM parameterless-parser pattern: it exists so tools/queries
+// that expect a (near-)zero-argument view of the schema have something to call directly, and so
+// it can be registered for auto-discovery by _ASim_NetworkSession().
+//
+// DEPENDENCY: vimNetworkSessionCloudflareGatewayCustom must already be saved as a function in
+// this workspace before saving this one -- deploy vimNetworkSessionCloudflareGatewayCustom.kql
+// first.
+//
+// Source table   : CloudflareV2_CL (Logpush datasets "gateway_network" and
+//                  "zero_trust_network_sessions")
+// Schema         : ASIM NetworkSession, schema version 1.0.0
+//
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Confirm vimNetworkSessionCloudflareGatewayCustom is already saved as a function.
+// 2. Paste this file into Log Analytics / Microsoft Sentinel > Logs and run it to confirm
+//    it returns rows.
+// 3. "Save as Function", name it exactly ASimNetworkSessionCloudflareGatewayCustom.
+// 4. Register this name in the workspace-deployed ASim_NetworkSessionCustom "Custom" slot so
+//    _ASim_NetworkSession() picks it up automatically alongside the built-in sources.
+// =============================================================================================
+let ASimNetworkSessionCloudflareGatewayCustom = (disabled:bool=false) {
+    vimNetworkSessionCloudflareGatewayCustom(
+        starttime = datetime(null),
+        endtime = datetime(null),
+        srcipaddr_has_any_prefix = dynamic([]),
+        dstipaddr_has_any_prefix = dynamic([]),
+        ipaddr_has_any_prefix = dynamic([]),
+        dstportnumber = int(null),
+        hostname_has_any = dynamic([]),
+        dvcaction = dynamic([]),
+        eventresult = "*",
+        disabled = disabled
+    )
+};
+ASimNetworkSessionCloudflareGatewayCustom(disabled)

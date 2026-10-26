@@ -1,0 +1,34 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "workspace": {
+            "type": "string",
+            "metadata": {
+                "description": "The Microsoft Sentinel workspace into which the function will be deployed. Has to be in the selected Resource Group."
+            }
+        }
+    },
+    "resources": [
+        {
+            "type": "Microsoft.OperationalInsights/workspaces/savedSearches",
+            "apiVersion": "2020-08-01",
+            "name": "[concat(parameters('workspace'), '/ASimWebSessionCloudflareWAFCustom')]",
+            "properties": {
+                "eTag": "*",
+                "displayName": "Cloudflare WAF WebSession Parser (Custom, CCF, parameterless)",
+                "category": "ASIM Custom Parsers",
+                "functionAlias": "ASimWebSessionCloudflareWAFCustom",
+                "functionParameters": "disabled:bool=false",
+                "version": 2,
+                "tags": [
+                    {
+                        "name": "description",
+                        "value": "Parameter-less wrapper around vimWebSessionCloudflareWAFCustom."
+                    }
+                ],
+                "query": "// =============================================================================================\n// ASIM WebSession Parser (parameter-less / \"ASim\") -- Cloudflare WAF / CDN (Custom, CCF connector)\n// =============================================================================================\n// Thin wrapper around vimWebSessionCloudflareWAFCustom, called with no-op filter values. This\n// is the standard ASIM parameterless-parser pattern: it exists so tools/queries that expect a\n// (near-)zero-argument view of the schema have something to call directly, and so it can be\n// registered for auto-discovery by _ASim_WebSession().\n//\n// DEPENDENCY: vimWebSessionCloudflareWAFCustom must already be saved as a function in this\n// workspace before saving this one -- deploy vimWebSessionCloudflareWAFCustom.kql first.\n//\n// Source table   : CloudflareV2_CL (Logpush dataset \"http_requests\")\n// Schema         : ASIM WebSession, schema version 1.0.0\n//\n// DEPLOYMENT\n// -----------------------------------------------------------------------------------------\n// 1. Confirm vimWebSessionCloudflareWAFCustom is already saved as a function.\n// 2. Paste this file into Log Analytics / Microsoft Sentinel > Logs and run it to confirm\n//    it returns rows.\n// 3. \"Save as Function\", name it exactly ASimWebSessionCloudflareWAFCustom.\n// 4. Register this name in the workspace-deployed ASim_WebSessionCustom \"Custom\" slot so\n//    _ASim_WebSession() picks it up automatically alongside the built-in sources.\n// =============================================================================================\nlet ASimWebSessionCloudflareWAFCustom = (disabled:bool=false) {\n    vimWebSessionCloudflareWAFCustom(\n        starttime = datetime(null),\n        endtime = datetime(null),\n        srcipaddr_has_any_prefix = dynamic([]),\n        ipaddr_has_any_prefix = dynamic([]),\n        url_has_any = dynamic([]),\n        httpuseragent_has_any = dynamic([]),\n        eventresultdetails_in = dynamic([]),\n        eventresult = \"*\",\n        disabled = disabled\n    )\n};\nASimWebSessionCloudflareWAFCustom(disabled)"
+            }
+        }
+    ]
+}

@@ -280,7 +280,7 @@ Syslog
 | Authentication parser | Validated on 4h of production data (marker simulated): SSH, WebGUI and OpenVPN logon/logoff/failure on more than 130 devices. No bad IPs, no missing users. Output column types checked. |
 | NetworkSession Syslog parser | Validated offline (`datatable` block in the `.kql`: IPv4 TCP/UDP/ICMP, IPv6 TCP, repeated lines), plus every filter parameter (`dvcaction`, IP prefixes with `ASimMatchingIpAddr`, `dstportnumber`, `hostname_has_any`, `eventresult`). **Pending:** live test stream. |
 | Legacy CEF parser | Validated on production `CommonSecurityLog`: 0 malformed rule names, 0 missing IPs, direction distribution checked. |
-| `ASimSchemaTester` / `ASimDataTester` | Not deployed in the workspace yet. Deploy them from the Azure-Sentinel repo and run them on all four parsers. |
+| `ASimSchemaTester` / `ASimDataTester` | Deployed in the workspace (2026-10-26). Not yet run on the pfSense parsers: run them on all four. |
 
 ## Next steps and cutover
 

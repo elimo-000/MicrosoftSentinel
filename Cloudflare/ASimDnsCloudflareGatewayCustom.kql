@@ -1,0 +1,37 @@
+// =============================================================================================
+// ASIM Dns Parser (parameter-less / "ASim") -- Cloudflare Gateway DNS (Custom, CCF connector)
+// =============================================================================================
+// Thin wrapper around vimDnsCloudflareGatewayCustom, called with no-op filter values. This is
+// the standard ASIM parameterless-parser pattern: it exists so tools/queries that expect a
+// (near-)zero-argument view of the schema have something to call directly, and so it can be
+// registered for auto-discovery by _ASim_Dns().
+//
+// DEPENDENCY: vimDnsCloudflareGatewayCustom must already be saved as a function in this
+// workspace before saving this one -- deploy vimDnsCloudflareGatewayCustom.kql first.
+//
+// Source table   : CloudflareV2_CL (Logpush dataset "gateway_dns")
+// Schema         : ASIM Dns, schema version 1.0.0
+//
+// DEPLOYMENT
+// -----------------------------------------------------------------------------------------
+// 1. Confirm vimDnsCloudflareGatewayCustom is already saved as a function.
+// 2. Paste this file into Log Analytics / Microsoft Sentinel > Logs and run it to confirm
+//    it returns rows.
+// 3. "Save as Function", name it exactly ASimDnsCloudflareGatewayCustom.
+// 4. Register this name in the workspace-deployed ASim_DnsCustom "Custom" slot so
+//    _ASim_Dns() picks it up automatically alongside the built-in sources.
+// =============================================================================================
+let ASimDnsCloudflareGatewayCustom = (disabled:bool=false) {
+    vimDnsCloudflareGatewayCustom(
+        starttime = datetime(null),
+        endtime = datetime(null),
+        srcipaddr = '*',
+        domain_has_any = dynamic([]),
+        responsecodename = '*',
+        response_has_ipv4 = '*',
+        response_has_any_prefix = dynamic([]),
+        eventtype = 'Query',
+        disabled = disabled
+    )
+};
+ASimDnsCloudflareGatewayCustom(disabled)
